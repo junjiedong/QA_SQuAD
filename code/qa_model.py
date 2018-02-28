@@ -120,6 +120,9 @@ class QAModel(object):
     def build_graph(self):
         """Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
 
+        Takes input from Word Embedding layer
+        Contextual Embedding Layer -> Attention Flow Layer -> Modeling Layer -> Output Layer
+
         Defines:
           self.logits_start, self.logits_end: Both tensors shape (batch_size, context_len).
             These are the logits (i.e. values that are fed into the softmax function) for the start and end distribution.
@@ -128,11 +131,7 @@ class QAModel(object):
             These are the result of taking (masked) softmax of logits_start and logits_end.
         """
 
-        # Takes input from Word Embedding layer
-        # Contextual Embedding Layer -> Attention Flow Layer -> Modeling Layer -> Output Layer
-
-        # Contextual Embedding Layer
-        # Use an RNN Encoder to get hidden states for the context and the question
+        # Contextual Embedding Layer: Use an RNN Encoder to get hidden states for the context and the question
         with tf.variable_scope("Encoder"):
             encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
             context_hiddens = encoder.build_graph(self.context_embs, self.context_mask, scope='context') # (batch_size, context_len, hidden_size*2)
@@ -141,35 +140,27 @@ class QAModel(object):
                 question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask, scope='context') # (batch_size, qn_len, hidden_size*2)
             else:
                 question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask, scope='question') # (batch_size, qn_len, hidden_size*2)
+            assert context_hiddens.get_shape().as_list() == [None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], "context_hiddens: expected {}, got {}".format([None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], context_hiddens.get_shape().as_list())
+            assert question_hiddens.get_shape().as_list() == [None, self.FLAGS.question_len, 2 * self.FLAGS.hidden_size], "question_hiddens: expected {}, got {}".format([None, self.FLAGS.question_len, 2 * self.FLAGS.hidden_size], question_hiddens.get_shape().as_list())
 
-        assert context_hiddens.get_shape().as_list() == [None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], "context_hiddens: expected {}, got {}".format([None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], context_hiddens.get_shape().as_list())
-        assert question_hiddens.get_shape().as_list() == [None, self.FLAGS.question_len, 2 * self.FLAGS.hidden_size], "question_hiddens: expected {}, got {}".format([None, self.FLAGS.question_len, 2 * self.FLAGS.hidden_size], question_hiddens.get_shape().as_list())
-
-        # Bi-directional Attention Flow
-        # (context_hiddens, question_hiddens) -> G (query-aware context representations)
-        # G: (None, context_len, 8 * hidden_size)
+        # Bi-directional Attention Flow: (context_hiddens, question_hiddens) -> G (query-aware context representations)
         with tf.variable_scope("AttentionFLow"):
             attn_layer = BidafAttention(self.keep_prob)
             G = attn_layer.build_graph(context_hiddens, self.context_mask, question_hiddens, self.qn_mask, 2 * self.FLAGS.hidden_size)
+            assert G.get_shape().as_list() == [None, self.FLAGS.context_len, 8 * self.FLAGS.hidden_size], "G: expected {}, got {}".format([None, self.FLAGS.context_len, 8 * self.FLAGS.hidden_size], G.get_shape().as_list())
 
-        assert G.get_shape().as_list() == [None, self.FLAGS.context_len, 8 * self.FLAGS.hidden_size], "G: expected {}, got {}".format([None, self.FLAGS.context_len, 8 * self.FLAGS.hidden_size], G.get_shape().as_list())
-
-        # LSTM Modeling Layer
-        # G (query-aware context representations) -> M (final context representation)
+        # LSTM Modeling Layer: G (query-aware context representations) -> M (final context representation)
         with tf.variable_scope("ModelingLayer"):
             model_layer = BidafModeling(self.FLAGS.hidden_size, self.keep_prob)
             M = model_layer.build_graph(G, self.context_mask)
+            assert M.get_shape().as_list() == [None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], "M: expected {}, got {}".format([None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], M.get_shape().as_list())
 
-        assert M.get_shape().as_list() == [None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], "M: expected {}, got {}".format([None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], M.get_shape().as_list())
-
-        # Use softmax layer to compute probability distribution for start location
-        # Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
+        # Use softmax layer to compute probability distribution for start location -> probdist_start: (batch_size, context_len)
         with vs.variable_scope("StartDist"):
             softmax_layer_start = SimpleSoftmaxLayer()
             self.logits_start, self.probdist_start = softmax_layer_start.build_graph(M, self.context_mask)
 
-        # Use softmax layer to compute probability distribution for end location
-        # Note this produces self.logits_end and self.probdist_end, both of which have shape (batch_size, context_len)
+        # Use softmax layer to compute probability distribution for end location -> probdist_end: (batch_size, context_len)
         with vs.variable_scope("EndDist"):
             softmax_layer_end = SimpleSoftmaxLayer()
             self.logits_end, self.probdist_end = softmax_layer_end.build_graph(M, self.context_mask)
