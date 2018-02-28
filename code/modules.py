@@ -44,12 +44,8 @@ class RNNEncoder(object):
         """
         self.hidden_size = hidden_size
         self.keep_prob = keep_prob
-        self.rnn_cell_fw = rnn_cell.LSTMCell(self.hidden_size)
-        self.rnn_cell_fw = DropoutWrapper(self.rnn_cell_fw, input_keep_prob=self.keep_prob)
-        self.rnn_cell_bw = rnn_cell.LSTMCell(self.hidden_size)
-        self.rnn_cell_bw = DropoutWrapper(self.rnn_cell_bw, input_keep_prob=self.keep_prob)
 
-    def build_graph(self, inputs, masks):
+    def build_graph(self, inputs, masks, scope):
         """
         Inputs:
           inputs: Tensor shape (batch_size, seq_len, input_size)
@@ -61,20 +57,23 @@ class RNNEncoder(object):
           out: Tensor shape (batch_size, seq_len, hidden_size*2).
             This is all hidden states (fw and bw hidden states are concatenated).
         """
-        with vs.variable_scope("RNNEncoder"):
-            input_lens = tf.reduce_sum(masks, reduction_indices=1) # shape (batch_size)
+        rnn_cell_fw = rnn_cell.LSTMCell(self.hidden_size)
+        rnn_cell_fw = DropoutWrapper(rnn_cell_fw, input_keep_prob=self.keep_prob)
+        rnn_cell_bw = rnn_cell.LSTMCell(self.hidden_size)
+        rnn_cell_bw = DropoutWrapper(rnn_cell_bw, input_keep_prob=self.keep_prob)
 
-            # Note: fw_out and bw_out are the hidden states for every timestep.
-            # Each is shape (batch_size, seq_len, hidden_size).
-            (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(self.rnn_cell_fw, self.rnn_cell_bw, inputs, input_lens, dtype=tf.float32)
+        input_lens = tf.reduce_sum(masks, reduction_indices=1) # shape (batch_size)
 
-            # Concatenate the forward and backward hidden states
-            out = tf.concat([fw_out, bw_out], 2)
+        # Note: fw_out and bw_out are the hidden states for every timestep. Each is shape (batch_size, seq_len, hidden_size).
+        (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(rnn_cell_fw, rnn_cell_bw, inputs, input_lens, dtype=tf.float32, scope=scope)
 
-            # Apply dropout
-            out = tf.nn.dropout(out, self.keep_prob)
+        # Concatenate the forward and backward hidden states
+        out = tf.concat([fw_out, bw_out], 2)
 
-            return out
+        # Apply dropout
+        out = tf.nn.dropout(out, self.keep_prob)
+
+        return out
 
 
 class SimpleSoftmaxLayer(object):
@@ -174,6 +173,129 @@ class BasicAttn(object):
             output = tf.nn.dropout(output, self.keep_prob)
 
             return attn_dist, output
+
+
+class BidafAttention(object):
+    """Module for Bi-directional Attention Flow Layer
+    Inputs:
+        Contextual representations of context and question
+    Returns:
+        Query-aware context representations - G
+    """
+
+    def __init__(self, keep_prob):
+        self.keep_prob = keep_prob
+
+    def build_graph(self, H, H_mask, U, U_mask, d):
+        """
+        Inputs:
+            H: [N, context_len, d]
+            U: [N, qn_len, d]
+            H_mask: [N, context_len]
+            U_mask: [N, qn_len]
+        Outputs:
+            G: [N, context_len, 4 * d]
+        """
+        # T: context length, J: question length
+        T = H.get_shape().as_list()[1]
+        J = U.get_shape().as_list()[1]
+
+        # Reshape H and U to be both (N, T, J, d)
+        H_new = tf.tile(tf.reshape(H, [-1, T, 1, d]), [1, 1, J, 1]) # H: (N, T, d) -> (N, T, 1, d) -> (N, T, J, d)
+        U_new = tf.tile(tf.reshape(U, [-1, 1, J, d]), [1, T, 1, 1]) # U: (N, J, d) -> (N, 1, J, d) -> (N, T, J, d)
+        # Reshape H_mask and U_mask to be both (N, T, J)
+        H_mask_new = tf.tile(tf.reshape(H_mask, [-1, T, 1]), [1, 1, J]) # H_mask: (N, T) -> (N, T, 1) -> (N, T, J)
+        U_mask_new = tf.tile(tf.reshape(U_mask, [-1, 1, J]), [1, T, 1]) # U_mask: (N, J) -> (N, 1, J) -> (N, T, J)
+        HU_mask_new = tf.cast(tf.cast(H_mask_new, tf.bool) & tf.cast(U_mask_new, tf.bool), tf.int32) # (N, T, J)
+
+        assert H_new.get_shape().as_list() == [None, T, J, d], "H_new: expected {}, got {}".format([None, T, J, d], H_new.get_shape().as_list())
+        assert U_new.get_shape().as_list() == [None, T, J, d], "U_new: expected {}, got {}".format([None, T, J, d], U_new.get_shape().as_list())
+        assert H_mask_new.get_shape().as_list() == [None, T, J], "H_mask_new: expected {}, got {}".format([None, T, J], H_mask_new.get_shape().as_list())
+        assert U_mask_new.get_shape().as_list() == [None, T, J], "U_mask_new: expected {}, got {}".format([None, T, J], U_mask_new.get_shape().as_list())
+        assert HU_mask_new.get_shape().as_list() == [None, T, J], "HU_mask_new: expected {}, got {}".format([None, T, J], HU_mask_new.get_shape().as_list())
+
+        # Concatenate H, U, and H*U, and apply dropout during training
+        HU_concat = tf.concat([H_new, U_new, tf.multiply(H_new, U_new)], 3) # (N, T, J, 3d)
+        HU_concat = tf.cond((self.keep_prob < 1.0), lambda: tf.nn.dropout(HU_concat, self.keep_prob), lambda: HU_concat)
+        assert HU_concat.get_shape().as_list() == [None, T, J, 3*d], "HU_concat: expected {}, got {}".format([None, T, J, 3*d], HU_concat.get_shape().as_list())
+
+        # Apply linear transformation to get similarity matrix S - (N, T, J)
+        with vs.variable_scope("AttnSimilarity"):
+            S = tf.contrib.layers.fully_connected(HU_concat, num_outputs=1, activation_fn=None) # (N, T, J, 1)
+            S = tf.squeeze(S, axis=[3]) # (N, T, J)
+            assert S.get_shape().as_list() == [None, T, J], "S: expected {}, got {}".format([None, T, J], S.get_shape().as_list())
+
+        # Context-to-query (C2Q) Attention
+        with vs.variable_scope("C2Q"):
+            _, a_c2q = masked_softmax(S, HU_mask_new, dim=-1)  # Softmax for each context t, (N, T, J)
+            assert a_c2q.get_shape().as_list() == [None, T, J], "a_c2q: expected {}, got {}".format([None, T, J], a_c2q.get_shape().as_list())
+
+            a_c2q = tf.tile(tf.reshape(a_c2q, [-1, T, J, 1]), [1, 1, 1, d])  # (N, T, J, d)
+            assert a_c2q.get_shape().as_list() == [None, T, J, d], "a_c2q: expected {}, got {}".format([None, T, J, d], a_c2q.get_shape().as_list())
+
+            attn_c2q = tf.reduce_sum(tf.multiply(a_c2q, U_new), axis=2) # reduce across the J-dimension -> (N, T, d)
+            assert attn_c2q.get_shape().as_list() == [None, T, d], "attn_c2q: expected {}, got {}".format([None, T, d], attn_c2q.get_shape().as_list())
+
+        # Query-to-context (Q2C) Attention
+        with vs.variable_scope("Q2C"):
+            b = tf.reduce_max(S, axis=-1) # reduce across the J-dimension -> (N, T)
+            assert b.get_shape().as_list() == [None, T], "b: expected {}, got {}".format([None, T], b.get_shape().as_list())
+
+            _, b = masked_softmax(b, H_mask, dim=-1) # (N, T)
+            assert b.get_shape().as_list() == [None, T], "b: expected {}, got {}".format([None, T], b.get_shape().as_list())
+
+            b = tf.tile(tf.reshape(b, [-1, T, 1]), [1, 1, d]) # (N, T, d)
+            assert b.get_shape().as_list() == [None, T, d], "b: expected {}, got {}".format([None, T, d], b.get_shape().as_list())
+
+            attn_q2c = tf.reduce_sum(tf.multiply(b, H), axis=1) # reduce across the T-dimension -> (N, d)
+            attn_q2c = tf.tile(tf.reshape(attn_q2c, [-1, 1, d]), [1, T, 1]) # (N, d) -> (N, 1, d) -> (N, T, d)
+            assert attn_q2c.get_shape().as_list() == [None, T, d], "attn_q2c: expected {}, got {}".format([None, T, d], attn_q2c.get_shape().as_list())
+
+        # Generate contextual embeddings using both attn_c2q and attn_q2c
+        with vs.variable_scope("AttentionConcat"):
+            attn_result = tf.concat([H, attn_c2q, tf.multiply(H, attn_c2q), tf.multiply(H, attn_q2c)], -1) # (N, T, 4 * d)
+            assert attn_result.get_shape().as_list() == [None, T, 4*d], "attn_result: expected {}, got {}".format([None, T, 4*d], attn_result.get_shape().as_list())
+
+        return attn_result
+
+
+class BidafModeling(object):
+    """
+        Module for LSTM Modeling Layer
+    """
+
+    def __init__(self, hidden_size, keep_prob):
+        self.keep_prob = keep_prob
+        self.hidden_size = hidden_size
+
+    def modeling_lstm(self, inputs, masks):
+        rnn_cell_fw = rnn_cell.LSTMCell(self.hidden_size)
+        rnn_cell_fw = DropoutWrapper(rnn_cell_fw, input_keep_prob=self.keep_prob)
+        rnn_cell_bw = rnn_cell.LSTMCell(self.hidden_size)
+        rnn_cell_bw = DropoutWrapper(rnn_cell_bw, input_keep_prob=self.keep_prob)
+
+        input_lens = tf.reduce_sum(masks, reduction_indices=1)
+
+        (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(rnn_cell_fw, rnn_cell_bw, inputs, input_lens, dtype=tf.float32)
+
+        out = tf.concat([fw_out, bw_out], 2)
+        out = tf.nn.dropout(out, self.keep_prob)
+        return out
+
+    def build_graph(self, G, G_mask):
+        """
+        Inputs:
+            G: (None, context_len, 8 * hidden_size)
+            G_mask: (None, context_len)
+        Returns:
+            M: (None, context_len, 2 * hidden_size)
+        """
+        with tf.variable_scope('FirstLayer'):
+            temp = self.modeling_lstm(G, G_mask)
+        with tf.variable_scope('SecondLayer'):
+            M = self.modeling_lstm(temp, G_mask)
+
+        return M
 
 
 def masked_softmax(logits, mask, dim):
