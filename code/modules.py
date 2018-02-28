@@ -17,7 +17,9 @@
 import tensorflow as tf
 from tensorflow.python.ops.rnn_cell import DropoutWrapper
 from tensorflow.python.ops import variable_scope as vs
-from tensorflow.python.ops import rnn_cell
+from tensorflow.python.ops import rnn_cell, nn_ops, math_ops, array_ops, init_ops
+from operator import mul
+from util import _linear
 
 
 class RNNEncoder(object):
@@ -186,6 +188,37 @@ class BidafAttention(object):
     def __init__(self, keep_prob):
         self.keep_prob = keep_prob
 
+    def get_logits(self, args, output_size, bias, input_keep_prob=1.0, is_train=None):
+        def flatten(tensor, keep):
+            fixed_shape = tensor.get_shape().as_list()
+            start = len(fixed_shape) - keep
+            left = reduce(mul, [fixed_shape[i] or tf.shape(tensor)[i] for i in range(start)])
+            out_shape = [left] + [fixed_shape[i] or tf.shape(tensor)[i] for i in range(start, len(fixed_shape))]
+            flat = tf.reshape(tensor, out_shape)
+            return flat
+
+        def reconstruct(tensor, ref, keep):
+            ref_shape = ref.get_shape().as_list()
+            tensor_shape = tensor.get_shape().as_list()
+            ref_stop = len(ref_shape) - keep
+            tensor_start = len(tensor_shape) - keep
+            pre_shape = [ref_shape[i] or tf.shape(ref)[i] for i in range(ref_stop)]
+            keep_shape = [tensor_shape[i] or tf.shape(tensor)[i] for i in range(tensor_start, len(tensor_shape))]
+            target_shape = pre_shape + keep_shape
+            out = tf.reshape(tensor, target_shape)
+            return out
+
+        assert len(args) == 3
+        flat_args = [flatten(arg, 1) for arg in args]
+        flat_args = [tf.cond(is_train, lambda: tf.nn.dropout(arg, input_keep_prob), lambda: arg) for arg in flat_args]
+
+        with tf.variable_scope("Linear_Logits"):
+            flat_logits = _linear(args=flat_args, output_size=output_size, bias=bias)
+
+        logits = reconstruct(flat_logits, args[0], 1)
+        logits = tf.squeeze(logits, [len(args[0].get_shape().as_list())-1])
+        return logits
+
     def build_graph(self, H, H_mask, U, U_mask, d):
         """
         Inputs:
@@ -208,21 +241,9 @@ class BidafAttention(object):
         U_mask_new = tf.tile(tf.reshape(U_mask, [-1, 1, J]), [1, T, 1]) # U_mask: (N, J) -> (N, 1, J) -> (N, T, J)
         HU_mask_new = tf.cast(tf.cast(H_mask_new, tf.bool) & tf.cast(U_mask_new, tf.bool), tf.int32) # (N, T, J)
 
-        assert H_new.get_shape().as_list() == [None, T, J, d], "H_new: expected {}, got {}".format([None, T, J, d], H_new.get_shape().as_list())
-        assert U_new.get_shape().as_list() == [None, T, J, d], "U_new: expected {}, got {}".format([None, T, J, d], U_new.get_shape().as_list())
-        assert H_mask_new.get_shape().as_list() == [None, T, J], "H_mask_new: expected {}, got {}".format([None, T, J], H_mask_new.get_shape().as_list())
-        assert U_mask_new.get_shape().as_list() == [None, T, J], "U_mask_new: expected {}, got {}".format([None, T, J], U_mask_new.get_shape().as_list())
-        assert HU_mask_new.get_shape().as_list() == [None, T, J], "HU_mask_new: expected {}, got {}".format([None, T, J], HU_mask_new.get_shape().as_list())
-
-        # Concatenate H, U, and H*U, and apply dropout during training
-        HU_concat = tf.concat([H_new, U_new, tf.multiply(H_new, U_new)], 3) # (N, T, J, 3d)
-        HU_concat = tf.cond((self.keep_prob < 1.0), lambda: tf.nn.dropout(HU_concat, self.keep_prob), lambda: HU_concat)
-        assert HU_concat.get_shape().as_list() == [None, T, J, 3*d], "HU_concat: expected {}, got {}".format([None, T, J, 3*d], HU_concat.get_shape().as_list())
-
-        # Apply linear transformation to get similarity matrix S - (N, T, J)
+        # Contruct the similarity matrix S, dimension: (N, T, J)
         with vs.variable_scope("AttnSimilarity"):
-            S = tf.contrib.layers.fully_connected(HU_concat, num_outputs=1, activation_fn=None) # (N, T, J, 1)
-            S = tf.squeeze(S, axis=[3]) # (N, T, J)
+            S = self.get_logits(args=[H_new, U_new, H_new * U_new], output_size=1, bias=None, input_keep_prob=self.keep_prob, is_train=(self.keep_prob<1.0))
             assert S.get_shape().as_list() == [None, T, J], "S: expected {}, got {}".format([None, T, J], S.get_shape().as_list())
 
         # Context-to-query (C2Q) Attention
@@ -257,6 +278,90 @@ class BidafAttention(object):
             assert attn_result.get_shape().as_list() == [None, T, 4*d], "attn_result: expected {}, got {}".format([None, T, 4*d], attn_result.get_shape().as_list())
 
         return attn_result
+
+
+# class BidafAttention(object):
+#     """Module for Bi-directional Attention Flow Layer
+#     Inputs:
+#         Contextual representations of context and question
+#     Returns:
+#         Query-aware context representations - G
+#     """
+#
+#     def __init__(self, keep_prob):
+#         self.keep_prob = keep_prob
+#
+#     def build_graph(self, H, H_mask, U, U_mask, d):
+#         """
+#         Inputs:
+#             H: [N, context_len, d]
+#             U: [N, qn_len, d]
+#             H_mask: [N, context_len]
+#             U_mask: [N, qn_len]
+#         Outputs:
+#             G: [N, context_len, 4 * d]
+#         """
+#         # T: context length, J: question length
+#         T = H.get_shape().as_list()[1]
+#         J = U.get_shape().as_list()[1]
+#
+#         # Reshape H and U to be both (N, T, J, d)
+#         H_new = tf.tile(tf.reshape(H, [-1, T, 1, d]), [1, 1, J, 1]) # H: (N, T, d) -> (N, T, 1, d) -> (N, T, J, d)
+#         U_new = tf.tile(tf.reshape(U, [-1, 1, J, d]), [1, T, 1, 1]) # U: (N, J, d) -> (N, 1, J, d) -> (N, T, J, d)
+#         # Reshape H_mask and U_mask to be both (N, T, J)
+#         H_mask_new = tf.tile(tf.reshape(H_mask, [-1, T, 1]), [1, 1, J]) # H_mask: (N, T) -> (N, T, 1) -> (N, T, J)
+#         U_mask_new = tf.tile(tf.reshape(U_mask, [-1, 1, J]), [1, T, 1]) # U_mask: (N, J) -> (N, 1, J) -> (N, T, J)
+#         HU_mask_new = tf.cast(tf.cast(H_mask_new, tf.bool) & tf.cast(U_mask_new, tf.bool), tf.int32) # (N, T, J)
+#
+#         assert H_new.get_shape().as_list() == [None, T, J, d], "H_new: expected {}, got {}".format([None, T, J, d], H_new.get_shape().as_list())
+#         assert U_new.get_shape().as_list() == [None, T, J, d], "U_new: expected {}, got {}".format([None, T, J, d], U_new.get_shape().as_list())
+#         assert H_mask_new.get_shape().as_list() == [None, T, J], "H_mask_new: expected {}, got {}".format([None, T, J], H_mask_new.get_shape().as_list())
+#         assert U_mask_new.get_shape().as_list() == [None, T, J], "U_mask_new: expected {}, got {}".format([None, T, J], U_mask_new.get_shape().as_list())
+#         assert HU_mask_new.get_shape().as_list() == [None, T, J], "HU_mask_new: expected {}, got {}".format([None, T, J], HU_mask_new.get_shape().as_list())
+#
+#         # Concatenate H, U, and H*U, and apply dropout during training
+#         HU_concat = tf.concat([H_new, U_new, tf.multiply(H_new, U_new)], 3) # (N, T, J, 3d)
+#         HU_concat = tf.cond((self.keep_prob < 1.0), lambda: tf.nn.dropout(HU_concat, self.keep_prob), lambda: HU_concat)
+#         assert HU_concat.get_shape().as_list() == [None, T, J, 3*d], "HU_concat: expected {}, got {}".format([None, T, J, 3*d], HU_concat.get_shape().as_list())
+#
+#         # Apply linear transformation to get similarity matrix S - (N, T, J)
+#         with vs.variable_scope("AttnSimilarity"):
+#             S = tf.contrib.layers.fully_connected(HU_concat, num_outputs=1, activation_fn=None) # (N, T, J, 1)
+#             S = tf.squeeze(S, axis=[3]) # (N, T, J)
+#             assert S.get_shape().as_list() == [None, T, J], "S: expected {}, got {}".format([None, T, J], S.get_shape().as_list())
+#
+#         # Context-to-query (C2Q) Attention
+#         with vs.variable_scope("C2Q"):
+#             _, a_c2q = masked_softmax(S, HU_mask_new, dim=-1)  # Softmax for each context t, (N, T, J)
+#             assert a_c2q.get_shape().as_list() == [None, T, J], "a_c2q: expected {}, got {}".format([None, T, J], a_c2q.get_shape().as_list())
+#
+#             a_c2q = tf.tile(tf.reshape(a_c2q, [-1, T, J, 1]), [1, 1, 1, d])  # (N, T, J, d)
+#             assert a_c2q.get_shape().as_list() == [None, T, J, d], "a_c2q: expected {}, got {}".format([None, T, J, d], a_c2q.get_shape().as_list())
+#
+#             attn_c2q = tf.reduce_sum(tf.multiply(a_c2q, U_new), axis=2) # reduce across the J-dimension -> (N, T, d)
+#             assert attn_c2q.get_shape().as_list() == [None, T, d], "attn_c2q: expected {}, got {}".format([None, T, d], attn_c2q.get_shape().as_list())
+#
+#         # Query-to-context (Q2C) Attention
+#         with vs.variable_scope("Q2C"):
+#             b = tf.reduce_max(S, axis=-1) # reduce across the J-dimension -> (N, T)
+#             assert b.get_shape().as_list() == [None, T], "b: expected {}, got {}".format([None, T], b.get_shape().as_list())
+#
+#             _, b = masked_softmax(b, H_mask, dim=-1) # (N, T)
+#             assert b.get_shape().as_list() == [None, T], "b: expected {}, got {}".format([None, T], b.get_shape().as_list())
+#
+#             b = tf.tile(tf.reshape(b, [-1, T, 1]), [1, 1, d]) # (N, T, d)
+#             assert b.get_shape().as_list() == [None, T, d], "b: expected {}, got {}".format([None, T, d], b.get_shape().as_list())
+#
+#             attn_q2c = tf.reduce_sum(tf.multiply(b, H), axis=1) # reduce across the T-dimension -> (N, d)
+#             attn_q2c = tf.tile(tf.reshape(attn_q2c, [-1, 1, d]), [1, T, 1]) # (N, d) -> (N, 1, d) -> (N, T, d)
+#             assert attn_q2c.get_shape().as_list() == [None, T, d], "attn_q2c: expected {}, got {}".format([None, T, d], attn_q2c.get_shape().as_list())
+#
+#         # Generate contextual embeddings using both attn_c2q and attn_q2c
+#         with vs.variable_scope("AttentionConcat"):
+#             attn_result = tf.concat([H, attn_c2q, tf.multiply(H, attn_c2q), tf.multiply(H, attn_q2c)], -1) # (N, T, 4 * d)
+#             assert attn_result.get_shape().as_list() == [None, T, 4*d], "attn_result: expected {}, got {}".format([None, T, 4*d], attn_result.get_shape().as_list())
+#
+#         return attn_result
 
 
 class BidafModeling(object):
