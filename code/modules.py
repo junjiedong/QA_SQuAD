@@ -25,16 +25,6 @@ class RNNEncoder(object):
     """
     General-purpose module to encode a sequence using a RNN.
     It feeds the input through a RNN and returns all the hidden states.
-
-    Note: In lecture 8, we talked about how you might use a RNN as an "encoder"
-    to get a single, fixed size vector representation of a sequence
-    (e.g. by taking element-wise max of hidden states).
-    Here, we're using the RNN as an "encoder" but we're not taking max;
-    we're just returning all the hidden states. The terminology "encoder"
-    still applies because we're getting a different "encoding" of each
-    position in the sequence, and we'll use the encodings downstream in the model.
-
-    This code uses a bidirectional GRU, but you could experiment with other types of RNN.
     """
 
     def __init__(self, hidden_size, keep_prob):
@@ -189,7 +179,8 @@ class BidafAttention(object):
 
     def build_graph(self, H, H_mask, U, U_mask, d):
         """
-        Compared to the old implementation, this version slightly improves the runtime
+        Compared to the old implementation, this version greatly improves the memory efficiency
+        This version allows much larger batch size, which in turn gives much better runtime and higher quality updates
 
         Inputs:
             H: [N, context_len, d]
@@ -331,6 +322,7 @@ class BidafAttention(object):
 class BidafModeling(object):
     """
         Module for LSTM Modeling Layer
+        Turns query-aware contextual representations into final feature representations
     """
 
     def __init__(self, hidden_size, keep_prob):

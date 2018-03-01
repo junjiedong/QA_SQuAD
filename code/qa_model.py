@@ -446,6 +446,19 @@ class QAModel(object):
         toc = time.time()
         logging.info("Number of params: %d (retrieval took %f secs)" % (num_params, toc - tic))
 
+        # Log the hyperparameters so that we know exactly what we ran
+        logging.info("---Hyperparameters---")
+        logging.info("learning_rate: {}".format(self.FLAGS.learning_rate))
+        logging.info("batch_size: {}".format(self.FLAGS.batch_size))
+        logging.info("dropout: {}".format(self.FLAGS.dropout))
+        logging.info("hidden_size: {}".format(self.FLAGS.hidden_size))
+        logging.info("embedding_size: {}".format(self.FLAGS.embedding_size))
+        logging.info("context_len: {}".format(self.FLAGS.context_len))
+        logging.info("question_len: {}".format(self.FLAGS.question_len))
+        logging.info("share_LSTM_weights: {}".format(self.FLAGS.share_LSTM_weights))
+        logging.info("max_gradient_norm: {}".format(self.FLAGS.max_gradient_norm))
+        logging.info("---------------------")
+
         # We will keep track of exponentially-smoothed loss
         exp_loss = None
 
@@ -517,6 +530,7 @@ class QAModel(object):
 
 
                     # Early stopping based on dev EM. You could switch this to use F1 instead.
+                    # Based on observations, EM and F1 show almost 100% the same trend during training
                     if best_dev_em is None or dev_em > best_dev_em:
                         best_dev_em = dev_em
                         logging.info("Saving to %s..." % bestmodel_ckpt_path)
