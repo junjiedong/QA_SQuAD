@@ -30,8 +30,8 @@ from tensorflow.python.ops import embedding_ops
 from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
 from pretty_print import print_example
-from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn
-from modules import BidafAttention, BidafModeling
+from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, masked_softmax
+from modules import BidafAttention, BidafModeling, SelfAttention, LSTM_Mapper
 
 logging.basicConfig(level=logging.INFO)
 
@@ -116,8 +116,128 @@ class QAModel(object):
             self.context_embs = embedding_ops.embedding_lookup(embedding_matrix, self.context_ids) # shape (batch_size, context_len, embedding_size)
             self.qn_embs = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
 
-
     def build_graph(self):
+
+        # Current best performing model
+        # F1: 74.6249; EM: 64.5506
+
+        T = self.FLAGS.context_len
+        d = self.FLAGS.hidden_size
+
+        with tf.variable_scope("Encoder"):  # Contextual Embedding Layer: Use an RNN Encoder to get hidden states for the context and the question
+            encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
+            context_hiddens = encoder.build_graph(self.context_embs, self.context_mask, scope='context') # (batch_size, context_len, hidden_size*2)
+            if self.FLAGS.share_LSTM_weights:
+                tf.get_variable_scope().reuse_variables()
+                question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask, scope='context') # (batch_size, qn_len, hidden_size*2)
+            else:
+                question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask, scope='question') # (batch_size, qn_len, hidden_size*2)
+
+        with tf.variable_scope("BidafAttention"):   # Bi-directional Attention Flow: (context_hiddens, question_hiddens) -> G (query-aware context representations)
+            bidaf_attn_layer = BidafAttention(self.keep_prob)
+            G = bidaf_attn_layer.build_graph(context_hiddens, self.context_mask, question_hiddens, self.qn_mask, 2 * self.FLAGS.hidden_size)
+
+        with tf.variable_scope("BidafModeling"):    # Blend the Bidaf representation using a Bi-LSTM (G -> M1)
+            BidafMapper = LSTM_Mapper(self.FLAGS.hidden_size, self.keep_prob)
+            M1 = BidafMapper.build_graph(G, self.context_mask) # (N, T, 2*d)
+
+        with tf.variable_scope("SelfAttention"):    # Apply self-attention to M1 -> self_attn_vecs
+            self_attn_layer = SelfAttention(self.FLAGS.hidden_size, self.keep_prob)
+            self_attn_vecs = self_attn_layer.build_graph(M1, self.context_mask) # (N, T, 6*d)
+            self_attn_vecs_d = tf.nn.dropout(self_attn_vecs, self.keep_prob) # (N, T, 6*d)
+            if self.FLAGS.dropout_selfattn:
+                self_attn_vecs = self_attn_vecs_d
+
+        selfattn_highway = False
+        with tf.variable_scope("SelfAttnModeling"): # Blend the self-attended representation (self_attn_vecs -> M2)
+            if selfattn_highway:
+                self_attn_vecs = tf.contrib.layers.fully_connected(self_attn_vecs, num_outputs=2*d, activation_fn=tf.nn.relu) # (N, T, 2*d)
+                self_attn_vecs = tf.nn.dropout(self_attn_vecs, self.keep_prob)
+
+                SelfAttnMapper = LSTM_Mapper(self.FLAGS.hidden_size, self.keep_prob)
+                M2 = SelfAttnMapper.build_graph(self_attn_vecs, self.context_mask)
+                M2 = tf.nn.dropout(M2, self.keep_prob)
+
+                transform_gate = tf.contrib.layers.fully_connected(self_attn_vecs, num_outputs=2*d, activation_fn=tf.nn.sigmoid) # (N, T, 2*d)
+                M2 = transform_gate * M2 + (1 - transform_gate) * self_attn_vecs # (N, T, 2*d)
+            else:
+                SelfAttnMapper = LSTM_Mapper(self.FLAGS.hidden_size, self.keep_prob)
+                M2 = SelfAttnMapper.build_graph(self_attn_vecs, self.context_mask)
+                M2 = tf.nn.dropout(M2, self.keep_prob)
+
+            assert M2.get_shape().as_list() == [None, T, 2*d]
+
+        with vs.variable_scope("StartDist"):    # Use softmax layer to compute probability distribution for start location -> probdist_start: (batch_size, context_len)
+            softmax_layer_start = SimpleSoftmaxLayer()
+            self.logits_start, self.probdist_start = softmax_layer_start.build_graph(M2, self.context_mask)
+
+        with vs.variable_scope("EndDist"):  # Use softmax layer to compute probability distribution for end location -> probdist_end: (batch_size, context_len)
+            softmax_layer_end = SimpleSoftmaxLayer()
+            self.logits_end, self.probdist_end = softmax_layer_end.build_graph(M2, self.context_mask)
+
+    def build_graph_allen(self):
+
+        # Referencing an implementation by AllenAI. Abandoned.
+
+        T = self.FLAGS.context_len
+
+        with tf.variable_scope("Encoder"):  # Contextual Embedding Layer: Use an RNN Encoder to get hidden states for the context and the question
+            encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
+            context_hiddens = encoder.build_graph(self.context_embs, self.context_mask, scope='context') # (batch_size, context_len, hidden_size*2)
+            if self.FLAGS.share_LSTM_weights:
+                tf.get_variable_scope().reuse_variables()
+                question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask, scope='context') # (batch_size, qn_len, hidden_size*2)
+            else:
+                question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask, scope='question') # (batch_size, qn_len, hidden_size*2)
+
+        with tf.variable_scope("BidafAttention"):   # Bi-directional Attention Flow: (context_hiddens, question_hiddens) -> G (query-aware context representations)
+            bidaf_attn_layer = BidafAttention(self.keep_prob)
+            G = bidaf_attn_layer.build_graph(context_hiddens, self.context_mask, question_hiddens, self.qn_mask, 2 * self.FLAGS.hidden_size) # (N, T, 8*d)
+            assert G.get_shape().as_list() == [None, T, 8 * self.FLAGS.hidden_size]
+
+        with tf.variable_scope("BidafMapper"):
+            G = tf.contrib.layers.fully_connected(G, num_outputs=2*self.FLAGS.hidden_size, activation_fn=tf.nn.relu, biases_initializer=None) # (N, T, 2*d) - bias or not?
+            assert G.get_shape().as_list() == [None, T, 2 * self.FLAGS.hidden_size]
+            G_d = tf.nn.dropout(G, self.keep_prob)
+            BidafMapper = LSTM_Mapper(self.FLAGS.hidden_size, self.keep_prob)
+            M = BidafMapper.build_graph(G_d, self.context_mask)
+            M = tf.nn.dropout(M, self.keep_prob) # (N, T, 2*d)
+            assert M.get_shape().as_list() == [None, T, 2 * self.FLAGS.hidden_size]
+
+        with tf.variable_scope("SelfAttention"):    # Apply self-attention to M -> self_attn_vecs
+            mask_bool = tf.cast(self.context_mask, tf.bool)
+            mask2d = tf.expand_dims(mask_bool, axis=1) & tf.expand_dims(mask_bool, axis=2)    #  (N, T, T)
+            assert mask2d.get_shape().as_list() == [None, T, T], "mask2d: expected {}, got {}".format([None, T, T], mask2d.get_shape().as_list())
+
+            sim = tf.matmul(M, tf.transpose(M, [0, 2, 1])) / ((2*self.FLAGS.hidden_size) ** 0.5) # Similarity matrix - (N, T, T)
+            sim_mask = tf.expand_dims(tf.eye(num_rows=T, dtype=tf.float32), axis=0) # (1, T, T)
+            sim -= (1e30) * sim_mask  # Force the word to align with other words
+            _, sim = masked_softmax(sim, mask2d, dim=-1)    # Softmax similarity - (N, T, T)
+            assert sim.get_shape().as_list() == [None, T, T], "sim: expected {}, got {}".format([None, T, T], sim.get_shape().as_list())
+
+            self_attn_vecs = tf.matmul(sim, M)    # Take the weighted average to obtain the self-attention vectors -> (N, T, 2*d)
+            assert self_attn_vecs.get_shape().as_list() == [None, T, 2 * self.FLAGS.hidden_size]
+
+            self_attn_vecs = tf.concat([self_attn_vecs, M, self_attn_vecs * M], axis=-1) # (N, T, 6*d)
+            assert self_attn_vecs.get_shape().as_list() == [None, T, 6 * self.FLAGS.hidden_size]
+
+        with tf.variable_scope("SelfAttnMapper"):
+            C = tf.contrib.layers.fully_connected(self_attn_vecs, num_outputs=2*self.FLAGS.hidden_size, activation_fn=tf.nn.relu, biases_initializer=None) # (N, T, 2*d)
+            assert C.get_shape().as_list() == [None, T, 2 * self.FLAGS.hidden_size]
+
+            C += G
+            C = tf.nn.dropout(C, self.keep_prob)
+            assert C.get_shape().as_list() == [None, T, 2 * self.FLAGS.hidden_size]
+
+        with vs.variable_scope("StartDist"):    # Use softmax layer to compute probability distribution for start location -> probdist_start: (batch_size, context_len)
+            softmax_layer_start = SimpleSoftmaxLayer()
+            self.logits_start, self.probdist_start = softmax_layer_start.build_graph(C, self.context_mask)
+
+        with vs.variable_scope("EndDist"):  # Use softmax layer to compute probability distribution for end location -> probdist_end: (batch_size, context_len)
+            softmax_layer_end = SimpleSoftmaxLayer()
+            self.logits_end, self.probdist_end = softmax_layer_end.build_graph(C, self.context_mask)
+
+    def build_graph_old(self):
         """Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
 
         Takes input from Word Embedding layer
@@ -151,9 +271,13 @@ class QAModel(object):
 
         # LSTM Modeling Layer: G (query-aware context representations) -> M (final context representation)
         with tf.variable_scope("ModelingLayer"):
-            model_layer = BidafModeling(self.FLAGS.hidden_size, self.keep_prob)
+            model_layer = SelfAttentionModeling(self.FLAGS.hidden_size, self.keep_prob)
+            # model_layer = BidafModeling(self.FLAGS.hidden_size, self.keep_prob)
             M = model_layer.build_graph(G, self.context_mask)
             assert M.get_shape().as_list() == [None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], "M: expected {}, got {}".format([None, self.FLAGS.context_len, 2 * self.FLAGS.hidden_size], M.get_shape().as_list())
+            if self.FLAGS.concat_MG:
+                M = tf.concat([M, tf.nn.dropout(G, self.keep_prob)], -1)
+                assert M.get_shape().as_list() == [None, self.FLAGS.context_len, 10 * self.FLAGS.hidden_size], "M: expected {}, got {}".format([None, self.FLAGS.context_len, 10 * self.FLAGS.hidden_size], M.get_shape().as_list())
 
         # Use softmax layer to compute probability distribution for start location -> probdist_start: (batch_size, context_len)
         with vs.variable_scope("StartDist"):
@@ -456,6 +580,7 @@ class QAModel(object):
         logging.info("context_len: {}".format(self.FLAGS.context_len))
         logging.info("question_len: {}".format(self.FLAGS.question_len))
         logging.info("share_LSTM_weights: {}".format(self.FLAGS.share_LSTM_weights))
+        logging.info("dropout_selfattn: {}".format(self.FLAGS.dropout_selfattn))
         logging.info("max_gradient_norm: {}".format(self.FLAGS.max_gradient_norm))
         logging.info("---------------------")
 
@@ -531,8 +656,8 @@ class QAModel(object):
 
                     # Early stopping based on dev EM. You could switch this to use F1 instead.
                     # Based on observations, EM and F1 show almost 100% the same trend during training
-                    if best_dev_em is None or dev_em > best_dev_em:
-                        best_dev_em = dev_em
+                    if best_dev_f1 is None or dev_f1 > best_dev_f1:
+                        best_dev_f1 = dev_f1
                         logging.info("Saving to %s..." % bestmodel_ckpt_path)
                         self.bestmodel_saver.save(session, bestmodel_ckpt_path, global_step=global_step)
 

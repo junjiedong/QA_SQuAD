@@ -53,6 +53,7 @@ tf.app.flags.DEFINE_integer("context_len", 400, "The maximum context length of y
 tf.app.flags.DEFINE_integer("question_len", 30, "The maximum question length of your model")
 tf.app.flags.DEFINE_integer("embedding_size", 100, "Size of the pretrained word vectors. This needs to be one of the available GloVe dimensions: 50/100/200/300")
 tf.app.flags.DEFINE_boolean("share_LSTM_weights", False, "Whether to share encoder LSTM weights for context and question")
+tf.app.flags.DEFINE_boolean("dropout_selfattn", True, "Whether to apply dropout to the self-attention output before feeding into RNN")
 
 # How often to print, save, eval
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
