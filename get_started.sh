@@ -9,10 +9,10 @@ EXP_DIR=$HEAD_DIR/experiments
 mkdir -p $EXP_DIR
 
 # Creates the environment
-conda create -n squad python=2.7
+conda create -n squad python=3
 
 # Activates the environment
-source activate squad
+source activate squad3
 
 # pip install into environment
 pip install -r requirements.txt

@@ -81,19 +81,19 @@ def print_example(word2id, context_tokens, qn_tokens, true_ans_start, true_ans_e
     context_tokens[pred_ans_end] = redback(context_tokens[pred_ans_end])
 
     # Print out the context
-    print "CONTEXT: (%s is true answer, %s is predicted start, %s is predicted end, _underscores_ are unknown tokens). Length: %i" % (greentext("green text"), magentaback("magenta background"), redback("red background"), len(context_tokens))
-    print " ".join(context_tokens)
+    print ("CONTEXT: (%s is true answer, %s is predicted start, %s is predicted end, _underscores_ are unknown tokens). Length: %i" % (greentext("green text"), magentaback("magenta background"), redback("red background"), len(context_tokens)))
+    print (" ".join(context_tokens))
 
     # Print out the question, true and predicted answer, F1 and EM score
     question = " ".join(qn_tokens)
 
-    print yellowtext("{:>20}: {}".format("QUESTION", question))
+    print (yellowtext("{:>20}: {}".format("QUESTION", question)))
     if truncated:
-        print redtext("{:>20}: {}".format("TRUE ANSWER", true_answer))
-        print redtext("{:>22}(True answer was truncated from context)".format(""))
+        print (redtext("{:>20}: {}".format("TRUE ANSWER", true_answer)))
+        print (redtext("{:>22}(True answer was truncated from context)".format("")))
     else:
-        print yellowtext("{:>20}: {}".format("TRUE ANSWER", true_answer))
-    print yellowtext("{:>20}: {}".format("PREDICTED ANSWER", pred_answer))
-    print yellowtext("{:>20}: {:4.3f}".format("F1 SCORE ANSWER", f1))
-    print yellowtext("{:>20}: {}".format("EM SCORE", em))
-    print ""
+        print (yellowtext("{:>20}: {}".format("TRUE ANSWER", true_answer)))
+    print (yellowtext("{:>20}: {}".format("PREDICTED ANSWER", pred_answer)))
+    print (yellowtext("{:>20}: {:4.3f}".format("F1 SCORE ANSWER", f1)))
+    print (yellowtext("{:>20}: {}".format("EM SCORE", em)))
+    print ("")

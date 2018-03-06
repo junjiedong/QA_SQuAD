@@ -14,8 +14,7 @@
 
 """This file defines the top-level model"""
 
-from __future__ import absolute_import
-from __future__ import division
+
 
 import time
 import logging
@@ -49,7 +48,7 @@ class QAModel(object):
           word2id: dictionary mapping word (string) to word idx (int)
           emb_matrix: numpy array shape (400002, embedding_size) containing pre-traing GloVe embeddings
         """
-        print "Initializing the QAModel..."
+        print ("Initializing the QAModel...")
         self.FLAGS = FLAGS
         self.id2word = id2word
         self.word2id = word2id
@@ -72,7 +71,7 @@ class QAModel(object):
         # (updates is what you need to fetch in session.run to do a gradient update)
         self.global_step = tf.Variable(0, name="global_step", trainable=False)
         opt = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate) # you can try other optimizers
-        self.updates = opt.apply_gradients(zip(clipped_gradients, params), global_step=self.global_step)
+        self.updates = opt.apply_gradients(list(zip(clipped_gradients, params)), global_step=self.global_step)
 
         # Define savers (for checkpointing) and summaries (for tensorboard)
         self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=FLAGS.keep)
@@ -465,7 +464,7 @@ class QAModel(object):
         # Calculate average loss
         total_num_examples = sum(batch_lengths)
         toc = time.time()
-        print "Computed dev loss over %i examples in %.2f seconds" % (total_num_examples, toc-tic)
+        print ("Computed dev loss over %i examples in %.2f seconds" % (total_num_examples, toc-tic))
 
         # Overall loss is total loss divided by total number of examples
         dev_loss = sum(loss_per_batch) / float(total_num_examples)
@@ -566,7 +565,7 @@ class QAModel(object):
         # Print number of model parameters
         tic = time.time()
         params = tf.trainable_variables()
-        num_params = sum(map(lambda t: np.prod(tf.shape(t.value()).eval()), params))
+        num_params = sum([np.prod(tf.shape(t.value()).eval()) for t in params])
         toc = time.time()
         logging.info("Number of params: %d (retrieval took %f secs)" % (num_params, toc - tic))
 

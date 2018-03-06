@@ -23,9 +23,9 @@ import nltk
 import numpy as np
 from tqdm import tqdm
 from six.moves.urllib.request import urlretrieve
+from importlib import reload
 
 reload(sys)
-sys.setdefaultencoding('utf8')
 random.seed(42)
 np.random.seed(42)
 
@@ -39,7 +39,7 @@ def setup_args():
 
 
 def write_to_file(out_file, line):
-    out_file.write(line.encode('utf8') + '\n')
+    out_file.write(line + '\n')
 
 
 def data_from_json(filename):
@@ -94,17 +94,17 @@ def maybe_download(url, filename, prefix, num_bytes=None):
     local_filename = None
     if not os.path.exists(os.path.join(prefix, filename)):
         try:
-            print "Downloading file {}...".format(url + filename)
+            print (("Downloading file {}...".format(url + filename)))
             with tqdm(unit='B', unit_scale=True, miniters=1, desc=filename) as t:
                 local_filename, _ = urlretrieve(url + filename, os.path.join(prefix, filename), reporthook=reporthook(t))
         except AttributeError as e:
-            print "An error occurred when downloading the file! Please get the dataset using a browser."
+            print ("An error occurred when downloading the file! Please get the dataset using a browser.")
             raise e
     # We have a downloaded file
     # Check the stats and make sure they are ok
     file_stats = os.stat(os.path.join(prefix, filename))
     if num_bytes is None or file_stats.st_size == num_bytes:
-        print "File {} successfully loaded".format(filename)
+        print (("File {} successfully loaded".format(filename)))
     else:
         raise Exception("Unexpected dataset size. Please get the dataset using a browser.")
 
@@ -132,9 +132,9 @@ def get_char_word_loc_mapping(context, context_tokens):
     mapping = dict()
 
     for char_idx, char in enumerate(context): # step through original characters
-        if char != u' ' and char != u'\n': # if it's not a space:
+        if char != ' ' and char != '\n': # if it's not a space:
             acc += char # add to accumulator
-            context_token = unicode(context_tokens[current_token_idx]) # current word token
+            context_token = str(context_tokens[current_token_idx]) # current word token
             if acc == context_token: # if the accumulator now matches the current word token
                 syn_start = char_idx - len(acc) + 1 # char loc of the start of this word
                 for char_loc in range(syn_start, char_idx+1):
@@ -169,12 +169,12 @@ def preprocess_and_write(dataset, tier, out_dir):
     num_mappingprob, num_tokenprob, num_spanalignprob = 0, 0, 0
     examples = []
 
-    for articles_id in tqdm(range(len(dataset['data'])), desc="Preprocessing {}".format(tier)):
+    for articles_id in tqdm(list(range(len(dataset['data']))), desc="Preprocessing {}".format(tier)):
 
         article_paragraphs = dataset['data'][articles_id]['paragraphs']
         for pid in range(len(article_paragraphs)):
 
-            context = unicode(article_paragraphs[pid]['context']) # string
+            context = str(article_paragraphs[pid]['context']) # string
 
             # The following replacements are suggested in the paper
             # BidAF (Seo et al., 2016)
@@ -196,11 +196,11 @@ def preprocess_and_write(dataset, tier, out_dir):
             for qn in qas:
 
                 # read the question text and tokenize
-                question = unicode(qn['question']) # string
+                question = str(qn['question']) # string
                 question_tokens = tokenize(question) # list of strings
 
                 # of the three answers, just take the first
-                ans_text = unicode(qn['answers'][0]['text']).lower() # get the answer text
+                ans_text = str(qn['answers'][0]['text']).lower() # get the answer text
                 ans_start_charloc = qn['answers'][0]['answer_start'] # answer start loc (character count)
                 ans_end_charloc = ans_start_charloc + len(ans_text) # answer end loc (character count) (exclusive)
 
@@ -230,13 +230,13 @@ def preprocess_and_write(dataset, tier, out_dir):
 
                 num_exs += 1
 
-    print "Number of (context, question, answer) triples discarded due to char -> token mapping problems: ", num_mappingprob
-    print "Number of (context, question, answer) triples discarded because character-based answer span is unaligned with tokenization: ", num_tokenprob
-    print "Number of (context, question, answer) triples discarded due character span alignment problems (usually Unicode problems): ", num_spanalignprob
-    print "Processed %i examples of total %i\n" % (num_exs, num_exs + num_mappingprob + num_tokenprob + num_spanalignprob)
+    print (("Number of (context, question, answer) triples discarded due to char -> token mapping problems: ", num_mappingprob))
+    print (("Number of (context, question, answer) triples discarded because character-based answer span is unaligned with tokenization: ", num_tokenprob))
+    print (("Number of (context, question, answer) triples discarded due character span alignment problems (usually Unicode problems): ", num_spanalignprob))
+    print (("Processed %i examples of total %i\n" % (num_exs, num_exs + num_mappingprob + num_tokenprob + num_spanalignprob)))
 
     # shuffle examples
-    indices = range(len(examples))
+    indices = list(range(len(examples)))
     np.random.shuffle(indices)
 
     with open(os.path.join(out_dir, tier +'.context'), 'w') as context_file,  \
@@ -257,8 +257,8 @@ def preprocess_and_write(dataset, tier, out_dir):
 def main():
     args = setup_args()
 
-    print "Will download SQuAD datasets to {}".format(args.data_dir)
-    print "Will put preprocessed SQuAD datasets in {}".format(args.data_dir)
+    print (("Will download SQuAD datasets to {}".format(args.data_dir)))
+    print (("Will put preprocessed SQuAD datasets in {}".format(args.data_dir)))
 
     if not os.path.exists(args.data_dir):
         os.makedirs(args.data_dir)
@@ -267,21 +267,21 @@ def main():
     dev_filename = "dev-v1.1.json"
 
     # download train set
-    maybe_download(SQUAD_BASE_URL, train_filename, args.data_dir, 30288272L)
+    maybe_download(SQUAD_BASE_URL, train_filename, args.data_dir, 30288272)
 
     # read train set
     train_data = data_from_json(os.path.join(args.data_dir, train_filename))
-    print "Train data has %i examples total" % total_exs(train_data)
+    print (("Train data has %i examples total" % total_exs(train_data)))
 
     # preprocess train set and write to file
     preprocess_and_write(train_data, 'train', args.data_dir)
 
     # download dev set
-    maybe_download(SQUAD_BASE_URL, dev_filename, args.data_dir, 4854279L)
+    maybe_download(SQUAD_BASE_URL, dev_filename, args.data_dir, 4854279)
 
     # read dev set
     dev_data = data_from_json(os.path.join(args.data_dir, dev_filename))
-    print "Dev data has %i examples total" % total_exs(dev_data)
+    print (("Dev data has %i examples total" % total_exs(dev_data)))
 
     # preprocess dev set and write to file
     preprocess_and_write(dev_data, 'dev', args.data_dir)

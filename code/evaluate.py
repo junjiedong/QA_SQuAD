@@ -1,5 +1,4 @@
 """ Official evaluation script for v1.1 of the SQuAD dataset. """
-from __future__ import print_function
 from collections import Counter
 import string
 import re
@@ -62,7 +61,7 @@ def evaluate(dataset, predictions):
                               ' will receive score 0.'
                     print(message, file=sys.stderr)
                     continue
-                ground_truths = list(map(lambda x: x['text'], qa['answers']))
+                ground_truths = list([x['text'] for x in qa['answers']])
                 prediction = predictions[qa['id']]
                 exact_match += metric_max_over_ground_truths(
                     exact_match_score, prediction, ground_truths)

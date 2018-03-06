@@ -15,8 +15,6 @@
 """This file contains a function to read the GloVe vectors from file,
 and return them as an embedding matrix"""
 
-from __future__ import absolute_import
-from __future__ import division
 
 from tqdm import tqdm
 import numpy as np
@@ -44,7 +42,7 @@ def get_glove(glove_path, glove_dim):
       id2word: dictionary mapping word id (int) to word (string)
     """
 
-    print "Loading GLoVE vectors from file: %s" % glove_path
+    print ("Loading GLoVE vectors from file: %s" % glove_path)
     vocab_size = int(4e5) # this is the vocab size of the corpus we've downloaded
 
     emb_matrix = np.zeros((vocab_size + len(_START_VOCAB), glove_dim))
