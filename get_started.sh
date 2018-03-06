@@ -9,7 +9,7 @@ EXP_DIR=$HEAD_DIR/experiments
 mkdir -p $EXP_DIR
 
 # Creates the environment
-conda create -n squad3 python=3
+conda create -n squad3 python=3.5
 
 # Activates the environment
 source activate squad3
