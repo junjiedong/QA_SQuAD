@@ -18,7 +18,7 @@ import tensorflow as tf
 from tensorflow.python.ops.rnn_cell import DropoutWrapper
 from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.ops import rnn_cell, nn_ops, math_ops, array_ops, init_ops
-from util import _linear, get_logits # After re-implementation of BiDAF, these two are no longer used
+from util import _linear, get_logits, VariationalDropout, TriLinearSim
 
 
 class RNNEncoder(object):
@@ -58,12 +58,8 @@ class RNNEncoder(object):
         # Note: fw_out and bw_out are the hidden states for every timestep. Each is shape (batch_size, seq_len, hidden_size).
         (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(rnn_cell_fw, rnn_cell_bw, inputs, input_lens, dtype=tf.float32, scope=scope)
 
-        # Concatenate the forward and backward hidden states
         out = tf.concat([fw_out, bw_out], 2)
-
-        # Apply dropout
-        out = tf.nn.dropout(out, self.keep_prob)
-
+        out = VariationalDropout(out, self.keep_prob)
         return out
 
 
@@ -73,9 +69,10 @@ class LSTM_Mapper(object):
     It feeds the input through a RNN and returns all the hidden states.
     No dropout is applied for the output
     """
-    def __init__(self, hidden_size, keep_prob):
+    def __init__(self, hidden_size, drop_in, keep_prob):
         self.hidden_size = hidden_size
         self.keep_prob = keep_prob
+        self.drop_in = drop_in  # Whether to add dropout wrapper for the input
 
     def build_graph(self, inputs, masks):
         """
@@ -88,9 +85,10 @@ class LSTM_Mapper(object):
         """
         with tf.variable_scope("LSTM_Mapper"):
             rnn_cell_fw = rnn_cell.LSTMCell(self.hidden_size)
-            rnn_cell_fw = DropoutWrapper(rnn_cell_fw, input_keep_prob=self.keep_prob)
             rnn_cell_bw = rnn_cell.LSTMCell(self.hidden_size)
-            rnn_cell_bw = DropoutWrapper(rnn_cell_bw, input_keep_prob=self.keep_prob)
+            if self.drop_in:
+                rnn_cell_fw = DropoutWrapper(rnn_cell_fw, input_keep_prob=self.keep_prob)
+                rnn_cell_bw = DropoutWrapper(rnn_cell_bw, input_keep_prob=self.keep_prob)
 
             input_lens = tf.reduce_sum(masks, reduction_indices=1) # shape (batch_size)
 
@@ -240,6 +238,7 @@ class BidafAttention(object):
 
         # Contruct the similarity matrix S, dimension: (N, T, J)
         with vs.variable_scope("AttnSimilarity"):
+            # S = TriLinearSim(H, U)  # (N, T, J)
             S_H = tf.contrib.layers.fully_connected(H_new, num_outputs=1, activation_fn=None, biases_initializer=None)   # (N, T, 1, 1)
             S_U = tf.contrib.layers.fully_connected(U_new, num_outputs=1, activation_fn=None, biases_initializer=None)   # (N, 1, J, 1)
             S_HU = tf.contrib.layers.fully_connected(H_new * U_new, num_outputs=1, activation_fn=None, biases_initializer=None) # (N, T, J, 1)
@@ -250,15 +249,13 @@ class BidafAttention(object):
             assert S_HU.get_shape().as_list() == [None, T, J, 1], "S_HU: expected {}, got {}".format([None, T, J, 1], S_HU.get_shape().as_list())
             assert S.get_shape().as_list() == [None, T, J], "S: expected {}, got {}".format([None, T, J], S.get_shape().as_list())
 
+
         # Context-to-query (C2Q) Attention
         with vs.variable_scope("C2Q"):
             _, a_c2q = masked_softmax(S, HU_mask_new, dim=-1)  # Softmax for each context t, (N, T, J)
             assert a_c2q.get_shape().as_list() == [None, T, J], "a_c2q: expected {}, got {}".format([None, T, J], a_c2q.get_shape().as_list())
 
-            a_c2q = tf.expand_dims(a_c2q, axis=-1)  # (N, T, J) -> (N, T, J, 1)
-            assert a_c2q.get_shape().as_list() == [None, T, J, 1], "a_c2q: expected {}, got {}".format([None, T, J, 1], a_c2q.get_shape().as_list())
-
-            attn_c2q = tf.reduce_sum(a_c2q * U_new, axis=2) # reduce across the J-dimension: (N, T, J, d) -> (N, T, d)
+            attn_c2q = tf.matmul(a_c2q, U)
             assert attn_c2q.get_shape().as_list() == [None, T, d], "attn_c2q: expected {}, got {}".format([None, T, d], attn_c2q.get_shape().as_list())
 
         # Query-to-context (Q2C) Attention
@@ -282,46 +279,6 @@ class BidafAttention(object):
             assert attn_result.get_shape().as_list() == [None, T, 4*d], "attn_result: expected {}, got {}".format([None, T, 4*d], attn_result.get_shape().as_list())
 
         return attn_result
-
-
-class BidafModeling(object):
-    """
-        Module for LSTM Modeling Layer
-        Turns query-aware contextual representations into final feature representations
-    """
-
-    def __init__(self, hidden_size, keep_prob):
-        self.keep_prob = keep_prob
-        self.hidden_size = hidden_size
-
-    def modeling_lstm(self, inputs, input_lens):
-        rnn_cell_fw = rnn_cell.LSTMCell(self.hidden_size)
-        rnn_cell_fw = DropoutWrapper(rnn_cell_fw, input_keep_prob=self.keep_prob)
-        rnn_cell_bw = rnn_cell.LSTMCell(self.hidden_size)
-        rnn_cell_bw = DropoutWrapper(rnn_cell_bw, input_keep_prob=self.keep_prob)
-
-        (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(rnn_cell_fw, rnn_cell_bw, inputs, input_lens, dtype=tf.float32)
-
-        out = tf.concat([fw_out, bw_out], 2)
-        out = tf.nn.dropout(out, self.keep_prob)
-        return out
-
-    def build_graph(self, G, G_mask):
-        """
-        Inputs:
-            G: (None, context_len, 8 * hidden_size)
-            G_mask: (None, context_len)
-        Returns:
-            M: (None, context_len, 2 * hidden_size)
-        """
-        input_lens = tf.reduce_sum(G_mask, reduction_indices=1)
-
-        with tf.variable_scope('FirstLayer'):
-            temp = self.modeling_lstm(G, input_lens)
-        with tf.variable_scope('SecondLayer'):
-            M = self.modeling_lstm(temp, input_lens)
-
-        return M
 
 
 class SelfAttention(object):
@@ -351,7 +308,7 @@ class SelfAttention(object):
         mask2d = tf.expand_dims(mask_bool, axis=1) & tf.expand_dims(mask_bool, axis=2)    #  (N, T, T)
         assert mask2d.get_shape().as_list() == [None, T, T], "mask2d: expected {}, got {}".format([None, T, T], mask2d.get_shape().as_list())
 
-        G_d = tf.nn.dropout(G, self.keep_prob)
+        G_d = VariationalDropout(G, self.keep_prob)
 
         # Use a fully-connected layer to reduce dimension
         Q = tf.contrib.layers.fully_connected(G_d, num_outputs=d, activation_fn=tf.nn.relu, biases_initializer=None) # (N, T, 8*d) -> (N, T, d)
@@ -372,7 +329,7 @@ class SelfAttention(object):
         assert SelfAttn.get_shape().as_list() == [None, T, 6*d], "SelfAttn: expected {}, got {}".format([None, T, 6*d], SelfAttn.get_shape().as_list())
 
         with tf.variable_scope("AttentionGate"):
-            SelfAttn_d = tf.nn.dropout(SelfAttn, self.keep_prob)
+            SelfAttn_d = VariationalDropout(SelfAttn, self.keep_prob)
             gate = tf.contrib.layers.fully_connected(SelfAttn_d, num_outputs=6*d, activation_fn=tf.nn.sigmoid, biases_initializer=None)
             assert gate.get_shape().as_list() == [None, T, 6*d], "gate: expected {}, got {}".format([None, T, 6*d], gate.get_shape().as_list())
 

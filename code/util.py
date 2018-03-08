@@ -8,6 +8,31 @@ _BIAS_VARIABLE_NAME = "biases"
 _WEIGHTS_VARIABLE_NAME = "weights"
 
 
+def VariationalDropout(x, keep_prob):
+    # Dropout mask is consistent across the time dimension
+    with tf.variable_scope("VariationalDropout"):
+        shape = tf.shape(x)
+        return tf.nn.dropout(x, keep_prob, [shape[0], 1, shape[2]])
+
+
+def TriLinearSim(x, keys):
+    # x: (N, T, d); keys: (N, J, d)
+    with tf.variable_scope("TriLinearSim"):
+        key_w = tf.get_variable("key_w", shape=keys.shape.as_list()[-1], dtype=tf.float32)
+        key_logits = tf.tensordot(keys, key_w, axes=[[2], [0]])  # (N, J)
+
+        x_w = tf.get_variable("input_w", shape=x.shape.as_list()[-1], dtype=tf.float32)
+        x_logits = tf.tensordot(x, x_w, axes=[[2], [0]])  # (N, T)
+
+        dot_w = tf.get_variable("dot_w", shape=x.shape.as_list()[-1], dtype=tf.float32)
+
+        # Compute x * dot_weights first, the batch mult with x
+        x_dots = x * tf.expand_dims(tf.expand_dims(dot_w, 0), 0)
+        dot_logits = tf.matmul(x_dots, keys, transpose_b=True)
+
+        return dot_logits + tf.expand_dims(key_logits, 1) + tf.expand_dims(x_logits, 2)
+        
+
 def _linear(args, output_size, bias, bias_start=0.0):
   """Linear map: sum_i(args[i] * W[i]), where W[i] is a variable.
   Args:
