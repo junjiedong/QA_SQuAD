@@ -28,3 +28,16 @@ python "$CODE_DIR/preprocessing/squad_preprocess.py" --data_dir "$DATA_DIR"
 
 # Download GloVe vectors to data/
 python "$CODE_DIR/preprocessing/download_wordvecs.py" --download_dir "$DATA_DIR"
+
+cd code/preprocessing/
+# preprocess for elmo
+python "elmo_preprocess.py"
+
+# preprocessing for pos/ne
+# python "pos_ne_preprocessing.py"
+# python "pos_ne_fast_validate.py"
+
+cd ../../
+# Install elmo
+cd bilm-tf
+python setup.py install
