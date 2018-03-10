@@ -19,16 +19,19 @@ truncate, pad and process it into batches ready for training"""
 import random
 import time
 import re
+import nltk
 
 import numpy as np
 from six.moves import xrange
 from vocab import PAD_ID, UNK_ID
+from bilm import Batcher
+from copy import deepcopy
 
 
 class Batch(object):
     """A class to hold the information needed for a training batch"""
 
-    def __init__(self, context_ids, context_mask, context_tokens, qn_ids, qn_mask, qn_tokens, ans_span, ans_tokens, uuids=None):
+    def __init__(self, context_ids, context_mask, context_tokens, qn_ids, qn_mask, qn_tokens, ans_span, ans_tokens, context_elmo, qn_elmo, context_pos_ids, qn_pos_ids, context_ne_ids, qn_ne_ids ,uuids=None):
         """
         Inputs:
           {context/qn}_ids: Numpy arrays.
@@ -43,10 +46,16 @@ class Batch(object):
         self.context_ids = context_ids
         self.context_mask = context_mask
         self.context_tokens = context_tokens
+        self.context_elmo = context_elmo
 
         self.qn_ids = qn_ids
         self.qn_mask = qn_mask
         self.qn_tokens = qn_tokens
+        self.qn_elmo = qn_elmo
+        self.context_pos_ids = context_pos_ids
+        self.qn_pos_ids = qn_pos_ids
+        self.context_ne_ids = context_ne_ids
+        self.qn_ne_ids = qn_ne_ids
 
         self.ans_span = ans_span
         self.ans_tokens = ans_tokens
@@ -77,6 +86,33 @@ def sentence_to_token_ids(sentence, word2id):
     ids = [word2id.get(w, UNK_ID) for w in tokens]
     return tokens, ids
 
+# NOTE: CHANGE
+def token_to_pos_ne_id(tokens, pos_tag_id_map, ne_tag_id_map):
+    """Turns an already-tokenized sentence string into word indices
+    e.g. "i do n't know" -> [9, 32, 16, 96]
+    Note any token that isn't in the word2id mapping gets mapped to the id for UNK
+    """
+    pos_tags = nltk.tree2conlltags(nltk.ne_chunk(nltk.pos_tag(tokens), binary=False))
+    pos_id = []
+    ne_id = []
+    for tag_p in pos_tags:
+        pos_tag = tag_p[1]
+        ne_tag = tag_p[2]
+        if pos_tag in pos_tag_id_map:
+            pos_id.append(pos_tag_id_map[pos_tag])
+        else:
+            print ('pos tag mis match')
+            pos_id.append(0)
+        if ne_tag in ne_tag_id_map:
+            ne_id.append(ne_tag_id_map[ne_tag])
+        else:
+            print ('ne tag mis match')
+            ne_id.append(0)
+    return pos_id, ne_id
+
+def get_pos_ne_id(line):
+    str_result = line.split()
+    return list(map(int, str_result))
 
 def padded(token_batch, batch_pad=0):
     """
@@ -91,7 +127,7 @@ def padded(token_batch, batch_pad=0):
     return [token_list + [PAD_ID] * (maxlen - len(token_list)) for token_list in token_batch]
 
 
-def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size, context_len, question_len, discard_long):
+def refill_batches(batches, word2id, context_file, qn_file, ans_file, context_pos_file, qn_pos_file, context_ne_file, qn_ne_file, batch_size, context_len, question_len, discard_long, batcher):
     """
     Adds more batches into the "batches" list.
 
@@ -108,6 +144,7 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
     tic = time.time()
     examples = [] # list of (qn_ids, context_ids, ans_span, ans_tokens) triples
     context_line, qn_line, ans_line = context_file.readline(), qn_file.readline(), ans_file.readline() # read the next line from each
+    context_pos_line, qn_pos_line, context_ne_line, qn_ne_line = context_pos_file.readline(), qn_pos_file.readline(), context_ne_file.readline(), qn_ne_file.readline()
 
     while context_line and qn_line and ans_line: # while you haven't reached the end
 
@@ -115,6 +152,8 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
         context_tokens, context_ids = sentence_to_token_ids(context_line, word2id)
         qn_tokens, qn_ids = sentence_to_token_ids(qn_line, word2id)
         ans_span = intstr_to_intlist(ans_line)
+        context_tokens_elmo = deepcopy(context_tokens)
+        qn_tokens_elmo = deepcopy(qn_tokens)
 
         # read the next line from each file
         context_line, qn_line, ans_line = context_file.readline(), qn_file.readline(), ans_file.readline()
@@ -132,6 +171,7 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
                 continue
             else: # truncate
                 qn_ids = qn_ids[:question_len]
+                qn_tokens_elmo = qn_tokens_elmo[:question_len]
 
         # discard or truncate too-long contexts
         if len(context_ids) > context_len:
@@ -139,9 +179,15 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
                 continue
             else: # truncate
                 context_ids = context_ids[:context_len]
+                context_tokens_elmo = context_tokens_elmo[:context_len]
 
         # add to examples
-        examples.append((context_ids, context_tokens, qn_ids, qn_tokens, ans_span, ans_tokens))
+        # NOTE: Change
+        context_pos_id = get_pos_ne_id(context_pos_line)
+        context_ne_id = get_pos_ne_id(context_ne_line)
+        qn_pos_id = get_pos_ne_id(qn_pos_line)
+        qn_ne_id = get_pos_ne_id(qn_ne_line)
+        examples.append((context_ids, context_tokens, qn_ids, qn_tokens, ans_span, ans_tokens, context_tokens_elmo, qn_tokens_elmo, context_pos_id, qn_pos_id, context_ne_id, qn_ne_id))
 
         # stop refilling if you have 160 batches
         if len(examples) == batch_size * 160:
@@ -157,9 +203,12 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
     for batch_start in range(0, len(examples), batch_size):
 
         # Note: each of these is a list length batch_size of lists of ints (except on last iter when it might be less than batch_size)
-        context_ids_batch, context_tokens_batch, qn_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch = list(zip(*examples[batch_start:batch_start+batch_size]))
+        context_ids_batch, context_tokens_batch, qn_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch, context_tokens_elmo_batch, qn_tokens_elmo_batch, context_pos_id_batch, qn_pos_id_batch, context_ne_id_batch, qn_ne_id_batch= list(zip(*examples[batch_start:batch_start+batch_size]))
 
-        batches.append((context_ids_batch, context_tokens_batch, qn_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch))
+        # NOTE: Change
+        context_elmo_batch = batcher.batch_sentences(context_tokens_elmo_batch, context_len) # already padded
+        qn_elmo_batch = batcher.batch_sentences(qn_tokens_elmo_batch, question_len) # already padded
+        batches.append((context_ids_batch, context_tokens_batch, qn_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch, context_elmo_batch, qn_elmo_batch,context_pos_id_batch, qn_pos_id_batch, context_ne_id_batch, qn_ne_id_batch))
 
     # shuffle the batches
     random.shuffle(batches)
@@ -169,7 +218,7 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
     return
 
 
-def get_batch_generator(word2id, context_path, qn_path, ans_path, batch_size, context_len, question_len, discard_long):
+def get_batch_generator(word2id, context_path, qn_path, ans_path, context_pos_path, qn_pos_path, context_ne_path, qn_ne_path, batch_size, context_len, question_len, discard_long, batcher):
     """
     This function returns a generator object that yields batches.
     The last batch in the dataset will be a partial batch.
@@ -184,34 +233,44 @@ def get_batch_generator(word2id, context_path, qn_path, ans_path, batch_size, co
         If False, truncate those exmaples instead.
     """
     context_file, qn_file, ans_file = open(context_path), open(qn_path), open(ans_path)
+    context_pos_file, qn_pos_file, context_ne_file, qn_ne_file = open(context_pos_path), open(qn_pos_path), open(context_ne_path), open(qn_ne_path)
     batches = []
 
     while True:
         if len(batches) == 0: # add more batches
-            refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size, context_len, question_len, discard_long)
+            refill_batches(batches, word2id, context_file, qn_file, ans_file, context_pos_file, qn_pos_file, context_ne_file, qn_ne_file, batch_size, context_len, question_len, discard_long, batcher)
         if len(batches) == 0:
             break
 
+        # NOTE: CHANGE
         # Get next batch. These are all lists length batch_size
-        (context_ids, context_tokens, qn_ids, qn_tokens, ans_span, ans_tokens) = batches.pop(0)
+        (context_ids, context_tokens, qn_ids, qn_tokens, ans_span, ans_tokens, context_elmo, qn_elmo, context_pos_ids, qn_pos_ids, context_ne_ids, qn_ne_ids) = batches.pop(0)
 
         # Pad context_ids and qn_ids
         qn_ids = padded(qn_ids, question_len) # pad questions to length question_len
         context_ids = padded(context_ids, context_len) # pad contexts to length context_len
+        context_pos_ids = padded(context_pos_ids, context_len)
+        context_ne_ids = padded(context_ne_ids, context_len)
+        qn_pos_ids = padded(qn_pos_ids, question_len)
+        qn_ne_ids = padded(qn_ne_ids, question_len)
 
         # Make qn_ids into a np array and create qn_mask
         qn_ids = np.array(qn_ids) # shape (question_len, batch_size)
         qn_mask = (qn_ids != PAD_ID).astype(np.int32) # shape (question_len, batch_size)
+        qn_pos_ids = np.array(qn_pos_ids)
+        qn_ne_ids = np.array(qn_ne_ids)
 
         # Make context_ids into a np array and create context_mask
         context_ids = np.array(context_ids) # shape (context_len, batch_size)
         context_mask = (context_ids != PAD_ID).astype(np.int32) # shape (context_len, batch_size)
+        context_pos_ids = np.array(context_pos_ids)
+        context_ne_ids = np.array(context_ne_ids)
 
         # Make ans_span into a np array
         ans_span = np.array(ans_span) # shape (batch_size, 2)
 
         # Make into a Batch object
-        batch = Batch(context_ids, context_mask, context_tokens, qn_ids, qn_mask, qn_tokens, ans_span, ans_tokens)
+        batch = Batch(context_ids, context_mask, context_tokens, qn_ids, qn_mask, qn_tokens, ans_span, ans_tokens, context_elmo, qn_elmo, context_pos_ids, qn_pos_ids, context_ne_ids, qn_ne_ids)
 
         yield batch
 

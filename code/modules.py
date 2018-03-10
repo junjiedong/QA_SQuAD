@@ -225,30 +225,17 @@ class BidafAttention(object):
         T = H.get_shape().as_list()[1]
         J = U.get_shape().as_list()[1]
 
-        H_new = tf.expand_dims(H, axis=2)   # H: (N, T, d) -> (N, T, 1, d)
-        U_new = tf.expand_dims(U, axis=1)   # U: (N, J, d) -> (N, 1, J, d)
         H_mask_new = tf.expand_dims(H_mask, axis=-1) # H_mask: (N, T) -> (N, T, 1)
         U_mask_new = tf.expand_dims(U_mask, axis=1) # U_mask: (N, J) -> (N, 1, J)
         HU_mask_new = tf.cast(H_mask_new, tf.bool) & tf.cast(U_mask_new, tf.bool) # (N, T, J)
-        assert H_new.get_shape().as_list() == [None, T, 1, d], "H_new: expected {}, got {}".format([None, T, 1, d], H_new.get_shape().as_list())
-        assert U_new.get_shape().as_list() == [None, 1, J, d], "U_new: expected {}, got {}".format([None, 1, J, d], U_new.get_shape().as_list())
         assert H_mask_new.get_shape().as_list() == [None, T, 1], "H_mask_new: expected {}, got {}".format([None, T, 1], H_mask_new.get_shape().as_list())
         assert U_mask_new.get_shape().as_list() == [None, 1, J], "U_mask_new: expected {}, got {}".format([None, 1, J], U_mask_new.get_shape().as_list())
         assert HU_mask_new.get_shape().as_list() == [None, T, J], "HU_mask_new: expected {}, got {}".format([None, T, J], HU_mask_new.get_shape().as_list())
 
         # Contruct the similarity matrix S, dimension: (N, T, J)
         with vs.variable_scope("AttnSimilarity"):
-            # S = TriLinearSim(H, U)  # (N, T, J)
-            S_H = tf.contrib.layers.fully_connected(H_new, num_outputs=1, activation_fn=None, biases_initializer=None)   # (N, T, 1, 1)
-            S_U = tf.contrib.layers.fully_connected(U_new, num_outputs=1, activation_fn=None, biases_initializer=None)   # (N, 1, J, 1)
-            S_HU = tf.contrib.layers.fully_connected(H_new * U_new, num_outputs=1, activation_fn=None, biases_initializer=None) # (N, T, J, 1)
-            S = S_HU + S_H + S_U    # (N, T, J, 1)
-            S = tf.squeeze(S, axis=[-1]) # (N, T, J)
-            assert S_H.get_shape().as_list() == [None, T, 1, 1], "S_H: expected {}, got {}".format([None, T, 1, 1], S_H.get_shape().as_list())
-            assert S_U.get_shape().as_list() == [None, 1, J, 1], "S_U: expected {}, got {}".format([None, 1, J, 1], S_U.get_shape().as_list())
-            assert S_HU.get_shape().as_list() == [None, T, J, 1], "S_HU: expected {}, got {}".format([None, T, J, 1], S_HU.get_shape().as_list())
+            S = TriLinearSim(H, U)  # (N, T, J)
             assert S.get_shape().as_list() == [None, T, J], "S: expected {}, got {}".format([None, T, J], S.get_shape().as_list())
-
 
         # Context-to-query (C2Q) Attention
         with vs.variable_scope("C2Q"):

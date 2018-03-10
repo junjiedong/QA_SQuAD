@@ -27,6 +27,7 @@ import tensorflow as tf
 from qa_model import QAModel
 from vocab import get_glove
 from official_eval_helper import get_json_data, generate_answers
+from bilm import Batcher
 
 
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +53,9 @@ tf.app.flags.DEFINE_integer("context_len", 400, "The maximum context length of y
 tf.app.flags.DEFINE_integer("question_len", 30, "The maximum question length of your model")
 tf.app.flags.DEFINE_integer("embedding_size", 300, "Size of the pretrained word vectors. This needs to be one of the available GloVe dimensions: 50/100/200/300")
 tf.app.flags.DEFINE_boolean("share_LSTM_weights", True, "Whether to share encoder LSTM weights for context and question")
+tf.app.flags.DEFINE_integer("elmo_embedding_max_token_size", 60, "Size of max lenght of a token (word)")
+tf.app.flags.DEFINE_integer("pos_embedding_size", 10, "Size of pos embedding")
+tf.app.flags.DEFINE_integer("ne_embedding_size", 10, "Size of name entity embedding")
 
 # How often to print, save, eval
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
@@ -66,6 +70,7 @@ tf.app.flags.DEFINE_string("data_dir", DEFAULT_DATA_DIR, "Where to find preproce
 tf.app.flags.DEFINE_string("ckpt_load_dir", "", "For official_eval mode, which directory to load the checkpoint fron. You need to specify this for official_eval mode.")
 tf.app.flags.DEFINE_string("json_in_path", "", "For official_eval mode, path to JSON input file. You need to specify this for official_eval_mode.")
 tf.app.flags.DEFINE_string("json_out_path", "predictions.json", "Output path for official_eval mode. Defaults to predictions.json")
+tf.app.flags.DEFINE_string("main_dir", MAIN_DIR, "The main directory.")
 
 
 FLAGS = tf.app.flags.FLAGS
@@ -181,6 +186,20 @@ def main(unused_argv):
         if FLAGS.ckpt_load_dir == "":
             raise Exception("For official_eval mode, you need to specify --ckpt_load_dir")
 
+        # NOTE: Change
+        pos_tag_id_map = {}
+        with open(os.path.join(FLAGS.main_dir, 'pos_tags.txt')) as f:
+            pos_tag_lines = f.readlines()
+        for i in range(len(pos_tag_lines)):
+            pos_tag_id_map[pos_tag_lines[i][:-1]] = i + 1 # need to get rid of the trailing newline character
+        # get the NE tag to id
+        ne_tag_id_map = {}
+        all_NE_tag = ['B-FACILITY', 'B-GPE', 'B-GSP', 'B-LOCATION', 'B-ORGANIZATION', 'B-PERSON', 'I-FACILITY', 'I-GPE', 'I-GSP', 'I-LOCATION', 'I-ORGANIZATION', 'I-PERSON','O'] # I know this not elegant
+        for i in range(len(all_NE_tag)):
+            ne_tag_id_map[all_NE_tag[i]] = i + 1
+
+        batcher = Batcher(os.path.join(FLAGS.data_dir, 'elmo_voca.txt'), FLAGS.elmo_embedding_max_token_size)
+
         # Read the JSON data from file
         qn_uuid_data, context_token_data, qn_token_data = get_json_data(FLAGS.json_in_path)
 
@@ -191,7 +210,7 @@ def main(unused_argv):
 
             # Get a predicted answer for each example in the data
             # Return a mapping answers_dict from uuid to answer
-            answers_dict = generate_answers(sess, qa_model, word2id, qn_uuid_data, context_token_data, qn_token_data)
+            answers_dict = generate_answers(sess, qa_model, word2id, qn_uuid_data, context_token_data, qn_token_data, batcher, pos_tag_id_map, ne_tag_id_map)
 
             # Write the uuid->answer mapping a to json file in root dir
             print ("Writing predictions to %s..." % FLAGS.json_out_path)

@@ -32,6 +32,7 @@ from pretty_print import print_example
 from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, masked_softmax
 from modules import BidafAttention, SelfAttention, LSTM_Mapper
 from util import VariationalDropout, TriLinearSim
+from bilm import Batcher, BidirectionalLanguageModel, weight_layers
 
 logging.basicConfig(level=logging.INFO)
 
@@ -53,11 +54,28 @@ class QAModel(object):
         self.FLAGS = FLAGS
         self.id2word = id2word
         self.word2id = word2id
+        self.batcher = Batcher(os.path.join(self.FLAGS.data_dir, 'elmo_voca.txt'), self.FLAGS.elmo_embedding_max_token_size)
+        # parse the map that map pos tag to pos id
+        self.pos_tag_id_map = {}
+        with open(os.path.join(self.FLAGS.main_dir, 'pos_tags.txt')) as f:
+            pos_tag_lines = f.readlines()
+        for i in range(len(pos_tag_lines)):
+            self.pos_tag_id_map[pos_tag_lines[i][:-1]] = i + 1 # need to get rid of the trailing newline character
+        # get the NE tag to id
+        self.ne_tag_id_map = {}
+        all_NE_tag = ['B-FACILITY', 'B-GPE', 'B-GSP', 'B-LOCATION', 'B-ORGANIZATION', 'B-PERSON', 'I-FACILITY', 'I-GPE', 'I-GSP', 'I-LOCATION', 'I-ORGANIZATION', 'I-PERSON','O'] # I know this not elegant
+        for i in range(len(all_NE_tag)):
+            self.ne_tag_id_map[all_NE_tag[i]] = i + 1
 
         # Add all parts of the graph
         with tf.variable_scope("QAModel", initializer=tf.contrib.layers.variance_scaling_initializer(factor=1.0, uniform=True)):
             self.add_placeholders()
             self.add_embedding_layer(emb_matrix)
+
+        # NOTE: CHANGE
+        self.add_embedding_layer_elmo(os.path.join(self.FLAGS.main_dir, 'options.json'), os.path.join(self.FLAGS.main_dir, 'lm_weights.hdf5'))
+
+        with tf.variable_scope("QAModel", initializer=tf.contrib.layers.variance_scaling_initializer(factor=1.0, uniform=True)):
             self.build_graph()
             self.add_loss()
 
@@ -89,8 +107,18 @@ class QAModel(object):
         # allows you to run the same model with variable batch_size
         self.context_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
         self.context_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
+        # NOTE: CHANGE
+        self.context_elmo = tf.placeholder(tf.int32, shape=[None, None, self.FLAGS.elmo_embedding_max_token_size])
+        self.context_pos_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
+        self.context_ne_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
+
         self.qn_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
         self.qn_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
+        # NOTE: CHANGE
+        self.qn_elmo = tf.placeholder(tf.int32, shape=[None, None, self.FLAGS.elmo_embedding_max_token_size])
+        self.qn_pos_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
+        self.qn_ne_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
+
         self.ans_span = tf.placeholder(tf.int32, shape=[None, 2])
 
         # Add a placeholder to feed in the keep probability (for dropout).
@@ -106,16 +134,52 @@ class QAModel(object):
           emb_matrix: shape (400002, embedding_size).
             The GloVe vectors, plus vectors for PAD and UNK.
         """
-        with vs.variable_scope("embeddings"):
+        with vs.variable_scope("embed_glove"):
 
             # Note: the embedding matrix is a tf.constant which means it's not a trainable parameter
             embedding_matrix = tf.constant(emb_matrix, dtype=tf.float32, name="emb_matrix") # shape (400002, embedding_size)
 
             # Get the word embeddings for the context and question,
             # using the placeholders self.context_ids and self.qn_ids
-            self.context_embs = embedding_ops.embedding_lookup(embedding_matrix, self.context_ids) # shape (batch_size, context_len, embedding_size)
-            self.qn_embs = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
+            self.context_embs_glove = embedding_ops.embedding_lookup(embedding_matrix, self.context_ids) # shape (batch_size, context_len, embedding_size)
+            self.qn_embs_glove = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
+        with vs.variable_scope("embed_pos"):
+            pos_embedding_matrix = tf.get_variable(name='pos_emb_matrix', shape=[len(self.pos_tag_id_map) + 1, self.FLAGS.pos_embedding_size])
+            self.context_embs_pos = embedding_ops.embedding_lookup(pos_embedding_matrix, self.context_pos_ids) # shape (batch_size, context_len, pos_embedding_size)
+            self.qn_embs_pos = embedding_ops.embedding_lookup(pos_embedding_matrix, self.qn_pos_ids) # shape (batch_size, question_len, pos_embedding_size)
+        with vs.variable_scope("ne_pos"):
+            ne_embedding_matrix = tf.get_variable(name='ne_emb_matrix', shape=[len(self.ne_tag_id_map) + 1, self.FLAGS.ne_embedding_size])
+            self.context_embs_ne = embedding_ops.embedding_lookup(pos_embedding_matrix, self.context_ne_ids) # shape (batch_size, context_len, ne_embedding_size)
+            self.qn_embs_ne = embedding_ops.embedding_lookup(pos_embedding_matrix, self.qn_ne_ids) # shape (batch_size, question_len, ne_embedding_size)
 
+    # NOTE: CHANGE
+    def add_embedding_layer_elmo(self, options_file, weight_file):
+        """
+        Adds word embedding layer to the graph.
+
+        Inputs:
+          options_file and weight_file for the pretrained elmo model
+        """
+        # Build the biLM graph.
+        bilm = BidirectionalLanguageModel(options_file, weight_file)
+
+        # Get ops to compute the LM embeddings.
+        context_embeddings_op = bilm(self.context_elmo)
+        question_embeddings_op = bilm(self.qn_elmo)
+
+        # Get an op to compute ELMo (weighted average of the internal biLM layers)
+        # Our SQuAD model includes ELMo at both the input and output layers
+        # of the task GRU, so we need 4x ELMo representations for the question
+        # and context at each of the input and output.
+        # We use the same ELMo weights for both the question and context
+        # at each of the input and output.
+        self.context_embs_elmo = weight_layers('input', context_embeddings_op, l2_coef=0.0)['weighted_op'] # shape(batch size, context size, 32)
+        with tf.variable_scope('', reuse=True):
+            # the reuse=True scope reuses weights from the context for the question
+            self.qn_embs_elmo = weight_layers(
+                'input', question_embeddings_op, l2_coef=0.0
+            )['weighted_op']
+            # shape(batch size, question len, 32)
 
     def build_graph(self):
         # Similar to an implementation by AllenAI
@@ -140,6 +204,11 @@ class QAModel(object):
 
         T = self.FLAGS.context_len
         d = self.FLAGS.hidden_size
+
+        # NOTE CHANGE: concantanate glove and elmo embedding
+        # TODO: is the mask correct?
+        self.context_embs = tf.concat([self.context_embs_elmo, self.context_embs_glove, self.context_embs_pos, self.context_embs_ne], 2)
+        self.qn_embs = tf.concat([self.qn_embs_elmo, self.qn_embs_glove, self.qn_embs_pos, self.qn_embs_ne], 2)
 
         with tf.variable_scope("Encoder"):  # Contextual Embedding Layer: Use an RNN Encoder to get hidden states for the context and the question
             context_hiddens, question_hiddens = VariationalEncoder(self.context_embs, self.qn_embs, self.context_mask, self.qn_mask, d, self.keep_prob)
@@ -219,6 +288,11 @@ class QAModel(object):
     def build_graph_v2(self):
         T = self.FLAGS.context_len
         d = self.FLAGS.hidden_size
+
+        # NOTE CHANGE: concantanate glove and elmo embedding
+        # TODO: is the mask correct?
+        self.context_embs = tf.concat([self.context_embs_elmo, self.context_embs_glove, self.context_embs_pos, self.context_embs_ne], 2)
+        self.qn_embs = tf.concat([self.qn_embs_elmo, self.qn_embs_glove, self.qn_embs_pos, self.qn_embs_ne], 2)
 
         with tf.variable_scope("Encoder"):  # Contextual Embedding Layer: Use an RNN Encoder to get hidden states for the context and the question
             encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
@@ -329,6 +403,12 @@ class QAModel(object):
         input_feed[self.qn_mask] = batch.qn_mask
         input_feed[self.ans_span] = batch.ans_span
         input_feed[self.keep_prob] = 1.0 - self.FLAGS.dropout # apply dropout
+        input_feed[self.context_elmo] = batch.context_elmo
+        input_feed[self.qn_elmo] = batch.qn_elmo
+        input_feed[self.context_pos_ids] = batch.context_pos_ids
+        input_feed[self.qn_pos_ids] = batch.qn_pos_ids
+        input_feed[self.context_ne_ids] = batch.context_ne_ids
+        input_feed[self.qn_ne_ids] = batch.qn_ne_ids
 
         # output_feed contains the things we want to fetch.
         output_feed = [self.updates, self.summaries, self.loss, self.global_step, self.param_norm, self.gradient_norm]
@@ -360,6 +440,12 @@ class QAModel(object):
         input_feed[self.qn_ids] = batch.qn_ids
         input_feed[self.qn_mask] = batch.qn_mask
         input_feed[self.ans_span] = batch.ans_span
+        input_feed[self.context_elmo] = batch.context_elmo
+        input_feed[self.qn_elmo] = batch.qn_elmo
+        input_feed[self.context_pos_ids] = batch.context_pos_ids
+        input_feed[self.qn_pos_ids] = batch.qn_pos_ids
+        input_feed[self.context_ne_ids] = batch.context_ne_ids
+        input_feed[self.qn_ne_ids] = batch.qn_ne_ids
         # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
 
         output_feed = [self.loss]
@@ -385,6 +471,12 @@ class QAModel(object):
         input_feed[self.context_mask] = batch.context_mask
         input_feed[self.qn_ids] = batch.qn_ids
         input_feed[self.qn_mask] = batch.qn_mask
+        input_feed[self.context_elmo] = batch.context_elmo
+        input_feed[self.qn_elmo] = batch.qn_elmo
+        input_feed[self.context_pos_ids] = batch.context_pos_ids
+        input_feed[self.qn_pos_ids] = batch.qn_pos_ids
+        input_feed[self.context_ne_ids] = batch.context_ne_ids
+        input_feed[self.qn_ne_ids] = batch.qn_ne_ids
         # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
 
         output_feed = [self.probdist_start, self.probdist_end]
@@ -441,13 +533,17 @@ class QAModel(object):
         logging.info("Calculating dev loss...")
         tic = time.time()
         loss_per_batch, batch_lengths = [], []
+        context_pos_path = dev_context_path + '.pos'
+        qn_pos_path = dev_qn_path + '.pos'
+        context_ne_path = dev_context_path + '.ne'
+        qn_ne_path = dev_qn_path + '.ne'
 
         # Iterate over dev set batches
         # Note: here we set discard_long=True, meaning we discard any examples
         # which are longer than our context_len or question_len.
         # We need to do this because if, for example, the true answer is cut
         # off the context, then the loss function is undefined.
-        for batch in get_batch_generator(self.word2id, dev_context_path, dev_qn_path, dev_ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=True):
+        for batch in get_batch_generator(self.word2id, dev_context_path, dev_qn_path, dev_ans_path, context_pos_path, qn_pos_path, context_ne_path, qn_ne_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=True, batcher=self.batcher):
 
             # Get loss for this batch
             loss = self.get_loss(session, batch)
@@ -498,11 +594,16 @@ class QAModel(object):
         em_total = 0.
         example_num = 0
 
+        context_pos_path = context_path + '.pos'
+        qn_pos_path = qn_path + '.pos'
+        context_ne_path = context_path + '.ne'
+        qn_ne_path = qn_path + '.ne'
+
         tic = time.time()
 
         # Note here we select discard_long=False because we want to sample from the entire dataset
         # That means we're truncating, rather than discarding, examples with too-long context or questions
-        for batch in get_batch_generator(self.word2id, context_path, qn_path, ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=False):
+        for batch in get_batch_generator(self.word2id, context_path, qn_path, ans_path, context_pos_path, qn_pos_path, context_ne_path, qn_ne_path,self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=False, batcher=self.batcher):
 
             pred_start_pos, pred_end_pos = self.get_start_end_pos(session, batch)
 
@@ -587,6 +688,11 @@ class QAModel(object):
         best_dev_f1 = None
         best_dev_em = None
 
+        context_pos_path = train_context_path + '.pos'
+        qn_pos_path = train_qn_path + '.pos'
+        context_ne_path = train_context_path + '.ne'
+        qn_ne_path = train_qn_path + '.ne'
+
         # for TensorBoard
         summary_writer = tf.summary.FileWriter(self.FLAGS.train_dir, session.graph)
 
@@ -598,7 +704,7 @@ class QAModel(object):
             epoch_tic = time.time()
 
             # Loop over batches
-            for batch in get_batch_generator(self.word2id, train_context_path, train_qn_path, train_ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=True):
+            for batch in get_batch_generator(self.word2id, train_context_path, train_qn_path, train_ans_path, context_pos_path, qn_pos_path, context_ne_path, qn_ne_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=True, batcher=self.batcher):
 
                 # Run training iteration
                 iter_tic = time.time()
