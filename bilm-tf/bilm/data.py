@@ -175,9 +175,9 @@ class UnicodeCharsVocabulary(Vocabulary):
             chars_ids = [self.word_to_char_ids(cur_word)
                      for cur_word in sentence]
         if reverse:
-            return np.vstack([self.eos_chars] + chars_ids + [self.bos_chars])
+            return np.vstack(chars_ids)
         else:
-            return np.vstack([self.bos_chars] + chars_ids + [self.eos_chars])
+            return np.vstack(chars_ids)
 
 
 class Batcher(object):
@@ -202,7 +202,7 @@ class Batcher(object):
         [['The', 'first', 'sentence', '.'], ['Second', '.']]
         '''
         n_sentences = len(sentences)
-        max_length = max(len(sentence) for sentence in sentences) + 2 if sentences_maxe_length == 0 else sentences_maxe_length + 2
+        max_length = max(len(sentence) for sentence in sentences) if sentences_maxe_length == 0 else sentences_maxe_length
 
         X_char_ids = np.zeros(
             (n_sentences, max_length, self._max_token_length),
@@ -210,7 +210,7 @@ class Batcher(object):
         )
 
         for k, sent in enumerate(sentences):
-            length = len(sent) + 2
+            length = len(sent)
             char_ids_without_mask = self._lm_vocab.encode_chars(
                 sent, split=False)
             # add one so that 0 is the mask value
