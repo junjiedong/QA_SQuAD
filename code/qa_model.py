@@ -54,7 +54,7 @@ class QAModel(object):
         self.FLAGS = FLAGS
         self.id2word = id2word
         self.word2id = word2id
-        self.batcher = Batcher(os.path.join(self.FLAGS.data_dir, 'elmo_voca.txt'), self.FLAGS.elmo_embedding_max_token_size)
+        self.batcher = Batcher(os.path.join(self.FLAGS.data_dir, 'elmo_voca.txt'), self.FLAGS.max_word_size)
         # parse the map that map pos tag to pos id
         self.pos_tag_id_map = {}
         with open(os.path.join(self.FLAGS.main_dir, 'pos_tags.txt')) as f:
@@ -67,15 +67,13 @@ class QAModel(object):
         for i in range(len(all_NE_tag)):
             self.ne_tag_id_map[all_NE_tag[i]] = i + 1
 
+        # filters for the char cnn
+        self.filters = [(1, 4), (2, 8), (3, 16), (4, 32), (5, 64)]
+
         # Add all parts of the graph
         with tf.variable_scope("QAModel", initializer=tf.contrib.layers.variance_scaling_initializer(factor=1.0, uniform=True)):
             self.add_placeholders()
             self.add_embedding_layer(emb_matrix)
-
-        # NOTE: CHANGE
-        self.add_embedding_layer_elmo(os.path.join(self.FLAGS.main_dir, 'options.json'), os.path.join(self.FLAGS.main_dir, 'lm_weights.hdf5'))
-
-        with tf.variable_scope("QAModel", initializer=tf.contrib.layers.variance_scaling_initializer(factor=1.0, uniform=True)):
             self.build_graph()
             self.add_loss()
 
@@ -108,16 +106,19 @@ class QAModel(object):
         self.context_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
         self.context_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
         # NOTE: CHANGE
-        self.context_elmo = tf.placeholder(tf.int32, shape=[None, None, self.FLAGS.elmo_embedding_max_token_size])
+        self.context_char = tf.placeholder(tf.int32, shape=[None, None, self.FLAGS.max_word_size])
         self.context_pos_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
         self.context_ne_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
 
         self.qn_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
         self.qn_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
         # NOTE: CHANGE
-        self.qn_elmo = tf.placeholder(tf.int32, shape=[None, None, self.FLAGS.elmo_embedding_max_token_size])
+        self.qn_char = tf.placeholder(tf.int32, shape=[None, None, self.FLAGS.max_word_size])
         self.qn_pos_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
         self.qn_ne_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
+
+        self.context_EM = tf.placeholder(tf.float32, shape=[None, self.FLAGS.context_len, 1])
+        self.qn_EM = tf.placeholder(tf.float32, shape=[None, self.FLAGS.question_len, 1])
 
         self.ans_span = tf.placeholder(tf.int32, shape=[None, 2])
 
@@ -125,6 +126,40 @@ class QAModel(object):
         # This is necessary so that we can instruct the model to use dropout when training, but not when testing
         self.keep_prob = tf.placeholder_with_default(1.0, shape=())
 
+
+    def add_char_embedding_layer(self):
+        with vs.variable_scope("embed_char"):
+            char_embedding_matrix = tf.get_variable(name='char_emb_matrix', shape=[self.FLAGS.num_of_char, self.FLAGS.char_embedding_size], initializer=tf.initializers.random_uniform(minval=-0.5, maxval=0.5, dtype=tf.float32))
+            context_char_embedding = embedding_ops.embedding_lookup(char_embedding_matrix, self.context_char)
+            qn_char_embedding = embedding_ops.embedding_lookup(char_embedding_matrix, self.qn_char)
+
+            def make_convolutions(inp, filters):
+                convolutions = []
+                for i, (width, num) in enumerate(filters):
+                    w_init = tf.random_uniform_initializer(
+                            minval=-0.05, maxval=0.05)
+                    w = tf.get_variable(
+                        "W_cnn_%s" % i,
+                        [1, width, self.FLAGS.char_embedding_size, num],
+                        initializer=w_init,
+                        dtype=tf.float32)
+                    b = tf.get_variable(
+                        "b_cnn_%s" % i, [num], dtype=tf.float32,
+                        initializer=tf.constant_initializer(0.0))
+
+                    conv = tf.nn.conv2d(inp, w, strides=[1, 1, 1, 1], padding="VALID") + b
+                    # now max pool
+                    conv = tf.nn.max_pool(conv, [1, 1, self.FLAGS.max_word_size - width + 1, 1],[1, 1, 1, 1], 'VALID')
+
+                    # activation
+                    conv = tf.nn.relu(conv)
+                    conv = tf.squeeze(conv, squeeze_dims=[2])
+                    convolutions.append(conv)
+                return tf.concat(convolutions, 2)
+
+            self.context_embs_char = make_convolutions(context_char_embedding, self.filters)
+            tf.get_variable_scope().reuse_variables()
+            self.qn_embs_char = make_convolutions(qn_char_embedding, self.filters)
 
     def add_embedding_layer(self, emb_matrix):
         """
@@ -143,14 +178,18 @@ class QAModel(object):
             # using the placeholders self.context_ids and self.qn_ids
             self.context_embs_glove = embedding_ops.embedding_lookup(embedding_matrix, self.context_ids) # shape (batch_size, context_len, embedding_size)
             self.qn_embs_glove = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
+
         with vs.variable_scope("embed_pos"):
-            pos_embedding_matrix = tf.get_variable(name='pos_emb_matrix', shape=[len(self.pos_tag_id_map) + 1, self.FLAGS.pos_embedding_size])
+            pos_embedding_matrix = tf.get_variable(name='pos_emb_matrix', shape=[len(self.pos_tag_id_map) + 1, self.FLAGS.pos_embedding_size], initializer=tf.initializers.random_uniform(minval=-0.5, maxval=0.5, dtype=tf.float32))
             self.context_embs_pos = embedding_ops.embedding_lookup(pos_embedding_matrix, self.context_pos_ids) # shape (batch_size, context_len, pos_embedding_size)
             self.qn_embs_pos = embedding_ops.embedding_lookup(pos_embedding_matrix, self.qn_pos_ids) # shape (batch_size, question_len, pos_embedding_size)
+
         with vs.variable_scope("ne_pos"):
-            ne_embedding_matrix = tf.get_variable(name='ne_emb_matrix', shape=[len(self.ne_tag_id_map) + 1, self.FLAGS.ne_embedding_size])
+            ne_embedding_matrix = tf.get_variable(name='ne_emb_matrix', shape=[len(self.ne_tag_id_map) + 1, self.FLAGS.ne_embedding_size], initializer=tf.initializers.random_uniform(minval=-0.5, maxval=0.5, dtype=tf.float32))
             self.context_embs_ne = embedding_ops.embedding_lookup(pos_embedding_matrix, self.context_ne_ids) # shape (batch_size, context_len, ne_embedding_size)
             self.qn_embs_ne = embedding_ops.embedding_lookup(pos_embedding_matrix, self.qn_ne_ids) # shape (batch_size, question_len, ne_embedding_size)
+
+        self.add_char_embedding_layer()
 
     # NOTE: CHANGE
     def add_embedding_layer_elmo(self, options_file, weight_file):
@@ -207,8 +246,8 @@ class QAModel(object):
 
         # NOTE CHANGE: concantanate glove and elmo embedding
         # TODO: is the mask correct?
-        self.context_embs = tf.concat([self.context_embs_elmo, self.context_embs_glove, self.context_embs_pos, self.context_embs_ne], 2)
-        self.qn_embs = tf.concat([self.qn_embs_elmo, self.qn_embs_glove, self.qn_embs_pos, self.qn_embs_ne], 2)
+        self.context_embs = tf.concat([self.context_embs_glove, self.context_embs_pos, self.context_embs_ne, self.context_embs_char, self.context_EM], 2)
+        self.qn_embs = tf.concat([self.qn_embs_glove, self.qn_embs_pos, self.qn_embs_ne, self.qn_embs_char, self.qn_EM], 2)
 
         with tf.variable_scope("Encoder"):  # Contextual Embedding Layer: Use an RNN Encoder to get hidden states for the context and the question
             context_hiddens, question_hiddens = VariationalEncoder(self.context_embs, self.qn_embs, self.context_mask, self.qn_mask, d, self.keep_prob)
@@ -291,8 +330,8 @@ class QAModel(object):
 
         # NOTE CHANGE: concantanate glove and elmo embedding
         # TODO: is the mask correct?
-        self.context_embs = tf.concat([self.context_embs_elmo, self.context_embs_glove, self.context_embs_pos, self.context_embs_ne], 2)
-        self.qn_embs = tf.concat([self.qn_embs_elmo, self.qn_embs_glove, self.qn_embs_pos, self.qn_embs_ne], 2)
+        self.context_embs = tf.concat([self.context_embs_glove, self.context_embs_pos, self.context_embs_ne, self.context_embs_char, self.context_EM], 2)
+        self.qn_embs = tf.concat([self.qn_embs_glove, self.qn_embs_pos, self.qn_embs_ne, self.qn_embs_char, self.qn_EM], 2)
 
         with tf.variable_scope("Encoder"):  # Contextual Embedding Layer: Use an RNN Encoder to get hidden states for the context and the question
             encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
@@ -403,12 +442,14 @@ class QAModel(object):
         input_feed[self.qn_mask] = batch.qn_mask
         input_feed[self.ans_span] = batch.ans_span
         input_feed[self.keep_prob] = 1.0 - self.FLAGS.dropout # apply dropout
-        input_feed[self.context_elmo] = batch.context_elmo
-        input_feed[self.qn_elmo] = batch.qn_elmo
+        input_feed[self.context_char] = batch.context_char
+        input_feed[self.qn_char] = batch.qn_char
         input_feed[self.context_pos_ids] = batch.context_pos_ids
         input_feed[self.qn_pos_ids] = batch.qn_pos_ids
         input_feed[self.context_ne_ids] = batch.context_ne_ids
         input_feed[self.qn_ne_ids] = batch.qn_ne_ids
+        input_feed[self.context_EM] = np.expand_dims(batch.context_em, axis=-1)
+        input_feed[self.qn_EM] = np.zeros((batch.context_em.shape[0], self.FLAGS.question_len, 1)) # padding
 
         # output_feed contains the things we want to fetch.
         output_feed = [self.updates, self.summaries, self.loss, self.global_step, self.param_norm, self.gradient_norm]
@@ -440,12 +481,14 @@ class QAModel(object):
         input_feed[self.qn_ids] = batch.qn_ids
         input_feed[self.qn_mask] = batch.qn_mask
         input_feed[self.ans_span] = batch.ans_span
-        input_feed[self.context_elmo] = batch.context_elmo
-        input_feed[self.qn_elmo] = batch.qn_elmo
+        input_feed[self.context_char] = batch.context_char
+        input_feed[self.qn_char] = batch.qn_char
         input_feed[self.context_pos_ids] = batch.context_pos_ids
         input_feed[self.qn_pos_ids] = batch.qn_pos_ids
         input_feed[self.context_ne_ids] = batch.context_ne_ids
         input_feed[self.qn_ne_ids] = batch.qn_ne_ids
+        input_feed[self.context_EM] = np.expand_dims(batch.context_em, axis=-1)
+        input_feed[self.qn_EM] = np.zeros((batch.context_em.shape[0], self.FLAGS.question_len, 1)) # padding
         # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
 
         output_feed = [self.loss]
@@ -471,12 +514,14 @@ class QAModel(object):
         input_feed[self.context_mask] = batch.context_mask
         input_feed[self.qn_ids] = batch.qn_ids
         input_feed[self.qn_mask] = batch.qn_mask
-        input_feed[self.context_elmo] = batch.context_elmo
-        input_feed[self.qn_elmo] = batch.qn_elmo
+        input_feed[self.context_char] = batch.context_char
+        input_feed[self.qn_char] = batch.qn_char
         input_feed[self.context_pos_ids] = batch.context_pos_ids
         input_feed[self.qn_pos_ids] = batch.qn_pos_ids
         input_feed[self.context_ne_ids] = batch.context_ne_ids
         input_feed[self.qn_ne_ids] = batch.qn_ne_ids
+        input_feed[self.context_EM] = np.expand_dims(batch.context_em, axis=-1)
+        input_feed[self.qn_EM] = np.zeros((batch.context_em.shape[0], self.FLAGS.question_len, 1)) # padding
         # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
 
         output_feed = [self.probdist_start, self.probdist_end]

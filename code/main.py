@@ -53,9 +53,12 @@ tf.app.flags.DEFINE_integer("context_len", 400, "The maximum context length of y
 tf.app.flags.DEFINE_integer("question_len", 30, "The maximum question length of your model")
 tf.app.flags.DEFINE_integer("embedding_size", 300, "Size of the pretrained word vectors. This needs to be one of the available GloVe dimensions: 50/100/200/300")
 tf.app.flags.DEFINE_boolean("share_LSTM_weights", True, "Whether to share encoder LSTM weights for context and question")
+tf.app.flags.DEFINE_integer("max_word_size", 40, "Size of max lenght of a token (word)")
 tf.app.flags.DEFINE_integer("elmo_embedding_max_token_size", 60, "Size of max lenght of a token (word)")
 tf.app.flags.DEFINE_integer("pos_embedding_size", 10, "Size of pos embedding")
 tf.app.flags.DEFINE_integer("ne_embedding_size", 10, "Size of name entity embedding")
+tf.app.flags.DEFINE_integer("char_embedding_size", 16, "Size of char embedding")
+tf.app.flags.DEFINE_integer("num_of_char", 262, "Size of char embedding")
 
 # How often to print, save, eval
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
@@ -198,7 +201,7 @@ def main(unused_argv):
         for i in range(len(all_NE_tag)):
             ne_tag_id_map[all_NE_tag[i]] = i + 1
 
-        batcher = Batcher(os.path.join(FLAGS.data_dir, 'elmo_voca.txt'), FLAGS.elmo_embedding_max_token_size)
+        batcher = Batcher(os.path.join(FLAGS.data_dir, 'elmo_voca.txt'), FLAGS.max_word_size)
 
         # Read the JSON data from file
         qn_uuid_data, context_token_data, qn_token_data = get_json_data(FLAGS.json_in_path)
