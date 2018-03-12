@@ -55,6 +55,10 @@ class QAModel(object):
         self.id2word = id2word
         self.word2id = word2id
         self.batcher = Batcher(os.path.join(self.FLAGS.data_dir, 'elmo_voca.txt'), self.FLAGS.max_word_size)
+
+        # NOTE: CHANGE
+        self.emb_matrix = emb_matrix
+
         # parse the map that map pos tag to pos id
         self.pos_tag_id_map = {}
         with open(os.path.join(self.FLAGS.main_dir, 'pos_tags.txt')) as f:
@@ -93,6 +97,15 @@ class QAModel(object):
         # Define savers (for checkpointing) and summaries (for tensorboard)
         self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=FLAGS.keep)
         self.bestmodel_saver = tf.train.Saver(tf.global_variables(), max_to_keep=1)
+
+        # NOTE: CHANGE
+        with tf.variable_scope("EMA"):
+            self.ema = tf.train.ExponentialMovingAverage(decay=0.999, zero_debias=True)
+            self.ema_ops = self.ema.apply(tf.trainable_variables())
+
+        self.ema_saver = tf.train.Saver(max_to_keep=FLAGS.keep)
+        self.ema_bestmodel_saver = tf.train.Saver(max_to_keep=1)
+
         self.summaries = tf.summary.merge_all()
 
 
@@ -169,15 +182,16 @@ class QAModel(object):
           emb_matrix: shape (400002, embedding_size).
             The GloVe vectors, plus vectors for PAD and UNK.
         """
-        with vs.variable_scope("embed_glove"):
+        # NOTE: CHANGE
+        with vs.variable_scope("embed_glove"), tf.device("/cpu:0"):
 
-            # Note: the embedding matrix is a tf.constant which means it's not a trainable parameter
-            embedding_matrix = tf.constant(emb_matrix, dtype=tf.float32, name="emb_matrix") # shape (400002, embedding_size)
+            # Use placeholder because we cannot generate tensor >2G
+            self.embedding_placeholder = tf.placeholder(tf.float32, [1917496, 300])
 
             # Get the word embeddings for the context and question,
             # using the placeholders self.context_ids and self.qn_ids
-            self.context_embs_glove = embedding_ops.embedding_lookup(embedding_matrix, self.context_ids) # shape (batch_size, context_len, embedding_size)
-            self.qn_embs_glove = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
+            self.context_embs_glove = embedding_ops.embedding_lookup(self.embedding_placeholder, self.context_ids) # shape (batch_size, context_len, embedding_size)
+            self.qn_embs_glove = embedding_ops.embedding_lookup(self.embedding_placeholder, self.qn_ids) # shape (batch_size, question_len, embedding_size)
 
         with vs.variable_scope("embed_pos"):
             pos_embedding_matrix = tf.get_variable(name='pos_emb_matrix', shape=[len(self.pos_tag_id_map) + 1, self.FLAGS.pos_embedding_size], initializer=tf.initializers.random_uniform(minval=-0.5, maxval=0.5, dtype=tf.float32))
@@ -450,12 +464,16 @@ class QAModel(object):
         input_feed[self.qn_ne_ids] = batch.qn_ne_ids
         input_feed[self.context_EM] = np.expand_dims(batch.context_em, axis=-1)
         input_feed[self.qn_EM] = np.zeros((batch.context_em.shape[0], self.FLAGS.question_len, 1)) # padding
+        # NOTE: CHANGE
+        input_feed[self.embedding_placeholder] = self.emb_matrix
 
         # output_feed contains the things we want to fetch.
         output_feed = [self.updates, self.summaries, self.loss, self.global_step, self.param_norm, self.gradient_norm]
 
         # Run the model
         [_, summaries, loss, global_step, param_norm, gradient_norm] = session.run(output_feed, input_feed)
+        # NOTE: CHANGE
+        session.run(self.ema_ops)
 
         # All summaries in the graph are added to Tensorboard
         summary_writer.add_summary(summaries, global_step)
@@ -489,6 +507,8 @@ class QAModel(object):
         input_feed[self.qn_ne_ids] = batch.qn_ne_ids
         input_feed[self.context_EM] = np.expand_dims(batch.context_em, axis=-1)
         input_feed[self.qn_EM] = np.zeros((batch.context_em.shape[0], self.FLAGS.question_len, 1)) # padding
+        # NOTE: CHANGE
+        input_feed[self.embedding_placeholder] = self.emb_matrix
         # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
 
         output_feed = [self.loss]
@@ -522,6 +542,8 @@ class QAModel(object):
         input_feed[self.qn_ne_ids] = batch.qn_ne_ids
         input_feed[self.context_EM] = np.expand_dims(batch.context_em, axis=-1)
         input_feed[self.qn_EM] = np.zeros((batch.context_em.shape[0], self.FLAGS.question_len, 1)) # padding
+        # NOTE: CHANGE
+        input_feed[self.embedding_placeholder] = self.emb_matrix
         # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
 
         output_feed = [self.probdist_start, self.probdist_end]
@@ -730,6 +752,11 @@ class QAModel(object):
         checkpoint_path = os.path.join(self.FLAGS.train_dir, "qa.ckpt")
         bestmodel_dir = os.path.join(self.FLAGS.train_dir, "best_checkpoint")
         bestmodel_ckpt_path = os.path.join(bestmodel_dir, "qa_best.ckpt")
+        # NOTE: CHANGE
+        ema_checkpoint_path = os.path.join(self.FLAGS.train_dir, "ema_qa.ckpt")
+        ema_bestmodel_dir = os.path.join(self.FLAGS.train_dir, "ema_best_checkpoint")
+        ema_bestmodel_ckpt_path = os.path.join(ema_bestmodel_dir, "qa_best.ckpt")
+
         best_dev_f1 = None
         best_dev_em = None
 
@@ -773,6 +800,9 @@ class QAModel(object):
                 if global_step % self.FLAGS.save_every == 0:
                     logging.info("Saving to %s..." % checkpoint_path)
                     self.saver.save(session, checkpoint_path, global_step=global_step)
+                    # NOTE: CHANGE
+                    logging.info("Saving to %s..." % ema_checkpoint_path)
+                    self.ema_saver.save(session, ema_checkpoint_path, global_step=global_step)
 
                 # Sometimes evaluate model on dev loss, train F1/EM and dev F1/EM
                 if global_step % self.FLAGS.eval_every == 0:
@@ -803,6 +833,9 @@ class QAModel(object):
                         best_dev_f1 = dev_f1
                         logging.info("Saving to %s..." % bestmodel_ckpt_path)
                         self.bestmodel_saver.save(session, bestmodel_ckpt_path, global_step=global_step)
+                        # NOTE: CHANGE
+                        logging.info("Saving to %s..." % ema_bestmodel_ckpt_path)
+                        self.ema_bestmodel_saver.save(session, ema_bestmodel_ckpt_path, global_step=global_step)
 
 
             epoch_toc = time.time()

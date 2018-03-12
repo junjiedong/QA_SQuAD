@@ -20,6 +20,9 @@ pip install -r requirements.txt
 # download punkt and perluniprops
 python -m nltk.downloader punkt
 python -m nltk.downloader perluniprops
+python -m nltk.downloader averaged_perceptron_tagger
+python -m nltk.downloader maxent_ne_chunker
+python -m nltk.downloader words
 
 # Download and preprocess SQuAD data and save in data/
 mkdir -p "$DATA_DIR"

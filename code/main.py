@@ -59,6 +59,8 @@ tf.app.flags.DEFINE_integer("pos_embedding_size", 10, "Size of pos embedding")
 tf.app.flags.DEFINE_integer("ne_embedding_size", 10, "Size of name entity embedding")
 tf.app.flags.DEFINE_integer("char_embedding_size", 16, "Size of char embedding")
 tf.app.flags.DEFINE_integer("num_of_char", 262, "Size of char embedding")
+# NOTE: Change
+tf.app.flags.DEFINE_boolean("load_ema_checkpoint", False, "Which checkpoint to load (ema/original)")
 
 # How often to print, save, eval
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
@@ -96,7 +98,14 @@ def initialize_model(session, model, train_dir, expect_exists):
     v2_path = ckpt.model_checkpoint_path + ".index" if ckpt else ""
     if ckpt and (tf.gfile.Exists(ckpt.model_checkpoint_path) or tf.gfile.Exists(v2_path)):
         print ("Reading model parameters from %s" % ckpt.model_checkpoint_path)
-        model.saver.restore(session, ckpt.model_checkpoint_path)
+
+        # NOTE: CHANGE
+        if FLAGS.load_ema_checkpoint:   # Restore using the EMA weights
+            ema_restorer = tf.train.Saver(model.ema.variables_to_restore())
+            ema_restorer.restore(session, ckpt.model_checkpoint_path)
+        else:   # Restore using the original weights
+            model.saver.restore(session, ckpt.model_checkpoint_path)
+
     else:
         if expect_exists:
             raise Exception("There is no saved checkpoint at %s" % train_dir)
@@ -125,9 +134,12 @@ def main(unused_argv):
 
     # Initialize bestmodel directory
     bestmodel_dir = os.path.join(FLAGS.train_dir, "best_checkpoint")
+    # NOTE: CHANGE
+    ema_bestmodel_dir = os.path.join(FLAGS.train_dir, "ema_best_checkpoint")
 
     # Define path for glove vecs
-    FLAGS.glove_path = FLAGS.glove_path or os.path.join(DEFAULT_DATA_DIR, "glove.6B.{}d.txt".format(FLAGS.embedding_size))
+    # NOTE: CHANGE
+    FLAGS.glove_path = FLAGS.glove_path or os.path.join(DEFAULT_DATA_DIR, "glove.42B.{}d.txt".format(FLAGS.embedding_size))
 
     # Load embedding matrix and vocab mappings
     emb_matrix, word2id, id2word = get_glove(FLAGS.glove_path, FLAGS.embedding_size)
@@ -163,6 +175,9 @@ def main(unused_argv):
         # Make bestmodel dir if necessary
         if not os.path.exists(bestmodel_dir):
             os.makedirs(bestmodel_dir)
+        # NOTE: CHANGE
+        if not os.path.exists(ema_bestmodel_dir):
+            os.makedirs(ema_bestmodel_dir)
 
         with tf.Session(config=config) as sess:
 
@@ -177,7 +192,12 @@ def main(unused_argv):
         with tf.Session(config=config) as sess:
 
             # Load best model
-            initialize_model(sess, qa_model, bestmodel_dir, expect_exists=True)
+            # NOTE: CHANGE
+            # initialize_model(sess, qa_model, bestmodel_dir, expect_exists=True)
+            if FLAGS.load_ema_checkpoint:
+                initialize_model(sess, qa_model, ema_bestmodel_dir, expect_exists=True)
+            else:
+                initialize_model(sess, qa_model, bestmodel_dir, expect_exists=True)
 
             # Show examples with F1/EM scores
             _, _ = qa_model.check_f1_em(sess, dev_context_path, dev_qn_path, dev_ans_path, "dev", num_samples=10, print_to_screen=True)
