@@ -28,6 +28,8 @@ from preprocessing.squad_preprocess import data_from_json, tokenize
 from vocab import UNK_ID, PAD_ID
 from data_batcher import padded, Batch, token_to_pos_ne_id, get_em
 from copy import deepcopy
+# NOTE: CHANGE (ENSEMBLE)
+from collections import Counter
 
 
 
@@ -302,5 +304,101 @@ def generate_answers(session, model, word2id, qn_uuid_data, context_token_data, 
             print ("Generated answers for %i/%i batches = %.2f%%" % (batch_num, num_batches, batch_num*100.0/num_batches))
 
     print ("Finished generating answers for dataset.")
+
+    return uuid2ans
+
+
+# NOTE: CHANGE (ENSEMBLE)
+def generate_partial_answers(session, model, word2id, qn_uuid_data, context_token_data, qn_token_data, batcher,pos_tag_id_map, ne_tag_id_map):
+
+    uuid2ans = {} # maps uuid to string containing predicted answer
+    data_size = len(qn_uuid_data)
+    num_batches = ((data_size-1) / model.FLAGS.batch_size) + 1
+    batch_num = 0
+    detokenizer = MosesDetokenizer()
+
+    print ("Start generating partial answers for a new base model...")
+
+    for batch in get_batch_generator(word2id, qn_uuid_data, context_token_data, qn_token_data, model.FLAGS.batch_size, model.FLAGS.context_len, model.FLAGS.question_len, batcher, pos_tag_id_map, ne_tag_id_map):
+
+        # Get the predicted spans and confidence scores
+        probdist_start_batch, probdist_end_batch, pred_start_batch, pred_end_batch = model.get_start_end_dist_pos(session, batch)
+
+        # Convert pred_start_batch and pred_end_batch to lists length batch_size
+        pred_start_batch = pred_start_batch.tolist()
+        pred_end_batch = pred_end_batch.tolist()
+
+        # For each example in the batch:
+        for ex_idx, (pred_start, pred_end) in enumerate(zip(pred_start_batch, pred_end_batch)):
+
+            # Original context tokens (no UNKs or padding) for this example
+            context_tokens = batch.context_tokens[ex_idx] # list of strings
+
+            # Check the predicted span is in range
+            assert pred_start in range(len(context_tokens))
+            assert pred_end in range(len(context_tokens))
+
+            # Calculate the confidence score
+            score = probdist_start_batch[ex_idx][pred_start] * probdist_end_batch[ex_idx][pred_end]
+
+            # Save (pred_start, pred_end, pred_prob) to the answer dict
+            uuid = batch.uuids[ex_idx]
+            uuid2ans[uuid] = ((pred_start, pred_end), score)
+
+        batch_num += 1
+
+        if batch_num % 10 == 0:
+            print ("Generated partial answers for %i/%i batches = %.2f%%" % (batch_num, num_batches, batch_num*100.0/num_batches))
+
+    print ("Finished generating all partial answers for this base model.")
+
+    return uuid2ans
+
+
+def generate_ensemble_answers(model, word2id, qn_uuid_data, context_token_data, qn_token_data, batcher,pos_tag_id_map, ne_tag_id_map, partial_answers):
+
+    def ensemble_vote(candidates):
+        # candidates: [((pred_start, pred_end), prob)]
+        # Simply pick the one with the highest confidence score
+        return max(candidates, key=lambda x: x[1])[0]
+
+    def ensemble_vote_v2(candidates):
+        # First use majority vote, then use prob for tie breaker
+        votes = Counter([i[0] for i in candidates])
+        return max(candidates, key=lambda x: (votes[x[0]], x[1]))[0]
+
+    def ensemble_vote_v3(candidates):
+        # This works slightly better than v2
+        votes = {}
+        for pred, prob in candidates:   # Calculate the sum of confidence scores
+            votes[pred] = votes.get(pred, 0) + prob
+
+        return max(votes.items(), key=lambda x: x[1])[0]
+
+
+    uuid2ans = {} # maps uuid to string containing predicted answer
+    data_size = len(qn_uuid_data)
+    num_batches = ((data_size-1) / model.FLAGS.batch_size) + 1
+    batch_num = 0
+    detokenizer = MosesDetokenizer()
+
+    print ("Generating final ensemble answers...")
+
+    for batch in get_batch_generator(word2id, qn_uuid_data, context_token_data, qn_token_data, model.FLAGS.batch_size, model.FLAGS.context_len, model.FLAGS.question_len, batcher, pos_tag_id_map, ne_tag_id_map):
+
+        for ex_idx, uuid in enumerate(batch.uuids):
+            pred_start, pred_end = ensemble_vote_v3([partial[uuid] for partial in partial_answers])
+
+            context_tokens = batch.context_tokens[ex_idx] # list of strings
+            pred_ans_tokens = context_tokens[pred_start : pred_end +1] # list of strings
+            # Detokenize and add to dict
+            uuid2ans[uuid] = detokenizer.detokenize(pred_ans_tokens, return_str=True)
+
+        batch_num += 1
+
+        if batch_num % 10 == 0:
+            print ("Generated answers for %i/%i batches = %.2f%%" % (batch_num, num_batches, batch_num*100.0/num_batches))
+
+    print ("Finished generating final ensemble answers for dataset.")
 
     return uuid2ans

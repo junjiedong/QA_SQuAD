@@ -28,6 +28,8 @@ from qa_model import QAModel
 from vocab import get_glove
 from official_eval_helper import get_json_data, generate_answers
 from bilm import Batcher
+# NOTE: CHANGE (ENSEMBLE)
+from official_eval_helper import generate_partial_answers, generate_ensemble_answers
 
 
 logging.basicConfig(level=logging.INFO)
@@ -60,7 +62,9 @@ tf.app.flags.DEFINE_integer("ne_embedding_size", 10, "Size of name entity embedd
 tf.app.flags.DEFINE_integer("char_embedding_size", 16, "Size of char embedding")
 tf.app.flags.DEFINE_integer("num_of_char", 262, "Size of char embedding")
 # NOTE: Change
-tf.app.flags.DEFINE_boolean("load_ema_checkpoint", False, "Which checkpoint to load (ema/original)")
+tf.app.flags.DEFINE_boolean("load_ema_checkpoint", True, "Which checkpoint to load (ema/original)")
+# NOTE: CHANGE (ENSEMBLE)
+tf.app.flags.DEFINE_string("single_ensemble", "", "Whether to use the single model or ensemble model")
 
 # How often to print, save, eval
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
@@ -221,25 +225,62 @@ def main(unused_argv):
         for i in range(len(all_NE_tag)):
             ne_tag_id_map[all_NE_tag[i]] = i + 1
 
-        batcher = Batcher(os.path.join(FLAGS.data_dir, 'elmo_voca.txt'), FLAGS.max_word_size)
+        # NOTE: CHANGE (ENSEMBLE)
+        if FLAGS.single_ensemble == "ensemble":
+            # Checkpoint directories of the base models
+            num_base_models = 7
+            checkpoint_dirs = [os.path.join(FLAGS.ckpt_load_dir, 'ema_best_checkpoint_' + str(i)) for i in range(1, num_base_models+1)]
 
-        # Read the JSON data from file
-        qn_uuid_data, context_token_data, qn_token_data = get_json_data(FLAGS.json_in_path)
+            partial_answers = []
+            for base_model_dir in checkpoint_dirs:
+                # Read the JSON data from file
+                qn_uuid_data, context_token_data, qn_token_data = get_json_data(FLAGS.json_in_path)
+                batcher = Batcher(os.path.join(FLAGS.data_dir, 'elmo_voca.txt'), FLAGS.max_word_size)
 
-        with tf.Session(config=config) as sess:
+                with tf.Session(config=config) as sess:
+                    initialize_model(sess, qa_model, base_model_dir, expect_exists=True)
+                    partial_answers.append(generate_partial_answers(sess, qa_model, word2id, qn_uuid_data, context_token_data, qn_token_data, batcher, pos_tag_id_map, ne_tag_id_map))
 
-            # Load model from ckpt_load_dir
-            initialize_model(sess, qa_model, FLAGS.ckpt_load_dir, expect_exists=True)
+            # # For debugging purpose
+            # for i, ans in enumerate(partial_answers):
+            #     with open("test"+ str(i+1) + ".txt", 'w') as F:
+            #         F.write(str(ans))
 
-            # Get a predicted answer for each example in the data
-            # Return a mapping answers_dict from uuid to answer
-            answers_dict = generate_answers(sess, qa_model, word2id, qn_uuid_data, context_token_data, qn_token_data, batcher, pos_tag_id_map, ne_tag_id_map)
+            # Aggregate all the partial answers to generate the final answer
+            qn_uuid_data, context_token_data, qn_token_data = get_json_data(FLAGS.json_in_path)
+            batcher = Batcher(os.path.join(FLAGS.data_dir, 'elmo_voca.txt'), FLAGS.max_word_size)
+            ensemble_answer_dict = generate_ensemble_answers(qa_model, word2id, qn_uuid_data, context_token_data, qn_token_data, batcher, pos_tag_id_map, ne_tag_id_map, partial_answers)
 
             # Write the uuid->answer mapping a to json file in root dir
             print ("Writing predictions to %s..." % FLAGS.json_out_path)
             with io.open(FLAGS.json_out_path, 'w', encoding='utf-8') as f:
-                f.write(str(json.dumps(answers_dict, ensure_ascii=False)))
+                f.write(str(json.dumps(ensemble_answer_dict, ensure_ascii=False)))
                 print ("Wrote predictions to %s" % FLAGS.json_out_path)
+
+
+        else:   # Original official_eval code
+            assert FLAGS.single_ensemble == "single"
+
+            batcher = Batcher(os.path.join(FLAGS.data_dir, 'elmo_voca.txt'), FLAGS.max_word_size)
+
+            # Read the JSON data from file
+            qn_uuid_data, context_token_data, qn_token_data = get_json_data(FLAGS.json_in_path)
+
+            with tf.Session(config=config) as sess:
+
+                # Load the first model in the checkpoint directory
+                checkpoint_dir = os.path.join(FLAGS.ckpt_load_dir, 'ema_best_checkpoint_1')
+                initialize_model(sess, qa_model, checkpoint_dir, expect_exists=True)
+
+                # Get a predicted answer for each example in the data
+                # Return a mapping answers_dict from uuid to answer
+                answers_dict = generate_answers(sess, qa_model, word2id, qn_uuid_data, context_token_data, qn_token_data, batcher, pos_tag_id_map, ne_tag_id_map)
+
+                # Write the uuid->answer mapping a to json file in root dir
+                print ("Writing predictions to %s..." % FLAGS.json_out_path)
+                with io.open(FLAGS.json_out_path, 'w', encoding='utf-8') as f:
+                    f.write(str(json.dumps(answers_dict, ensure_ascii=False)))
+                    print ("Wrote predictions to %s" % FLAGS.json_out_path)
 
 
     else:

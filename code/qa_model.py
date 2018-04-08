@@ -586,6 +586,32 @@ class QAModel(object):
             return start_pos, end_pos
 
 
+    # NOTE: CHANGE (ENSEMBLE)
+    def get_start_end_dist_pos(self, session, batch):
+
+            # Get start_dist and end_dist, both shape (batch_size, context_len)
+            start_dist, end_dist = self.get_prob_dists(session, batch)
+            batch_size, context_len = start_dist.shape
+            start_dist = np.expand_dims(start_dist,2)
+            end_dist = np.expand_dims(end_dist,1)
+            dist_mat =np.matmul(start_dist,end_dist)
+
+            mask = np.triu(np.ones((context_len,context_len)))
+            mask = np.tril(mask,13)
+            mask = np.repeat(mask[:,:,np.newaxis],batch_size,axis=2)
+            mask = np.transpose(mask,(2,0,1))
+            assert dist_mat.shape==mask.shape and mask.shape==(batch_size,context_len,context_len), "expected {}, got dist {}, mask {}".format((batch_size,context_len,context_len), dist_mat.shape,mask.shape)
+            prob_mat = dist_mat*mask
+
+            start_pos = np.argmax(np.amax(prob_mat,axis=2),axis=1)
+            end_pos = np.argmax(np.amax(prob_mat,axis=1),axis=1)
+
+            # start_pos = np.argmax(start_dist, axis=1)
+            # end_pos = np.argmax(end_dist, axis=1)
+
+            return start_dist[:, :, 0], end_dist[:, 0, :], start_pos, end_pos
+
+
     def get_dev_loss(self, session, dev_context_path, dev_qn_path, dev_ans_path):
         """
         Get loss for entire dev set.
